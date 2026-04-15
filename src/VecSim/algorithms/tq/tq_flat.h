@@ -15,6 +15,9 @@
 #include "VecSim/utils/vec_utils.h"
 
 #include <algorithm>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -30,6 +33,49 @@ inline constexpr uint64_t kQjlSeedOffset = 0xCAFEBABE00000001ULL;
 
 inline bool IsEven(size_t value) { return value != 0 && value % 2 == 0; }
 inline size_t PairCount(size_t dim) { return dim / 2; }
+
+inline float DotProduct(const float *lhs, const float *rhs, size_t dim) {
+#if defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    size_t idx = 0;
+    for (; idx + 4 <= dim; idx += 4) {
+        acc = vmlaq_f32(acc, vld1q_f32(lhs + idx), vld1q_f32(rhs + idx));
+    }
+    float sum = vaddvq_f32(acc);
+    for (; idx < dim; ++idx) {
+        sum += lhs[idx] * rhs[idx];
+    }
+    return sum;
+#else
+    float sum = 0.0f;
+    for (size_t idx = 0; idx < dim; ++idx) {
+        sum += lhs[idx] * rhs[idx];
+    }
+    return sum;
+#endif
+}
+
+inline float SumSquares(const float *values, size_t dim) {
+#if defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    size_t idx = 0;
+    for (; idx + 4 <= dim; idx += 4) {
+        const float32x4_t vec = vld1q_f32(values + idx);
+        acc = vmlaq_f32(acc, vec, vec);
+    }
+    float sum = vaddvq_f32(acc);
+    for (; idx < dim; ++idx) {
+        sum += values[idx] * values[idx];
+    }
+    return sum;
+#else
+    float sum = 0.0f;
+    for (size_t idx = 0; idx < dim; ++idx) {
+        sum += values[idx] * values[idx];
+    }
+    return sum;
+#endif
+}
 
 struct QueryView {
     const float *polar_lookup;
@@ -51,8 +97,10 @@ public:
         : dim(dim), pairs(PairCount(dim)), total_bits(total_bits), polar_bits(total_bits - 1),
           projections(projections), seed(seed), use_rotation(use_rotation),
           levels(size_t{1} << polar_bits), packed_qjl_bytes((projections + 7) / 8),
-          compact_angle_codes(levels <= 256), use_polar_lookup(levels <= 256),
+          nibble_angle_codes(levels <= 16), compact_angle_codes(levels <= 256),
+          use_polar_lookup(levels <= 256),
           qjl_scale(kPi / (2.0f * static_cast<float>(projections))), rotation_columns(dim * dim, 0.0f),
+          rotation_rows(dim * dim, 0.0f),
           qjl_projection_rows(projections * dim, 0.0f), cos_lut(levels), sin_lut(levels) {
         if (!IsEven(dim)) {
             throw std::invalid_argument("TQ-FLAT requires even dimensions");
@@ -110,6 +158,9 @@ public:
     bool usePolarLut() const { return use_polar_lookup; }
     bool compactAngles() const { return compact_angle_codes; }
     size_t angleCodeBytes() const {
+        if (nibble_angle_codes) {
+            return (pairs + 1) / 2;
+        }
         return pairs * (compactAngles() ? sizeof(uint8_t) : sizeof(uint16_t));
     }
     size_t polarQueryWordCount() const { return usePolarLut() ? pairs * levels : dim; }
@@ -120,11 +171,7 @@ public:
             return;
         }
         for (size_t row = 0; row < dim; ++row) {
-            float sum = 0.0f;
-            for (size_t col = 0; col < dim; ++col) {
-                sum += rotation_columns[col * dim + row] * input[col];
-            }
-            output[row] = sum;
+            output[row] = DotProduct(rotation_rows.data() + row * dim, input, dim);
         }
     }
 
@@ -134,11 +181,7 @@ public:
             return;
         }
         for (size_t col = 0; col < dim; ++col) {
-            float sum = 0.0f;
-            for (size_t row = 0; row < dim; ++row) {
-                sum += rotation_columns[col * dim + row] * input[row];
-            }
-            output[col] = sum;
+            output[col] = DotProduct(rotation_columns.data() + col * dim, input, dim);
         }
     }
 
@@ -168,12 +211,8 @@ public:
 
     void projectQjl(const float *input, float *output) const {
         for (size_t row = 0; row < projections; ++row) {
-            float sum = 0.0f;
             const float *projection_row = qjl_projection_rows.data() + row * dim;
-            for (size_t col = 0; col < dim; ++col) {
-                sum += projection_row[col] * input[col];
-            }
-            output[row] = sum;
+            output[row] = DotProduct(projection_row, input, dim);
         }
     }
 
@@ -197,6 +236,20 @@ public:
     }
 
     void writeAngleCodes(const uint16_t *source_angles, void *destination) const {
+        if (nibble_angle_codes) {
+            auto *encoded = static_cast<uint8_t *>(destination);
+            std::memset(encoded, 0, angleCodeBytes());
+            for (size_t i = 0; i < pairs; ++i) {
+                const uint8_t angle = static_cast<uint8_t>(source_angles[i] & 0x0F);
+                const size_t byte_idx = i / 2;
+                if ((i % 2) == 0) {
+                    encoded[byte_idx] = angle;
+                } else {
+                    encoded[byte_idx] |= static_cast<uint8_t>(angle << 4);
+                }
+            }
+            return;
+        }
         if (compactAngles()) {
             auto *encoded = static_cast<uint8_t *>(destination);
             for (size_t i = 0; i < pairs; ++i) {
@@ -208,6 +261,12 @@ public:
     }
 
     uint16_t angleCodeAt(const StorageView &storage, size_t idx) const {
+        if (nibble_angle_codes) {
+            const auto *encoded = static_cast<const uint8_t *>(storage.angle_indices);
+            const uint8_t packed = encoded[idx / 2];
+            return (idx % 2 == 0) ? static_cast<uint16_t>(packed & 0x0F)
+                                  : static_cast<uint16_t>((packed >> 4) & 0x0F);
+        }
         if (compactAngles()) {
             return static_cast<const uint8_t *>(storage.angle_indices)[idx];
         }
@@ -278,6 +337,7 @@ public:
     bool use_rotation;
     size_t levels;
     size_t packed_qjl_bytes;
+    bool nibble_angle_codes;
     bool compact_angle_codes;
     bool use_polar_lookup;
     float qjl_scale;
@@ -332,6 +392,12 @@ private:
                 throw std::runtime_error("Failed to construct TQ rotation");
             }
         }
+        for (size_t row = 0; row < dim; ++row) {
+            float *dst_row = rotation_rows.data() + row * dim;
+            for (size_t col = 0; col < dim; ++col) {
+                dst_row[col] = rotation_columns[col * dim + row];
+            }
+        }
     }
 
     void initializeQjlProjectionRows() {
@@ -353,6 +419,7 @@ private:
     }
 
     std::vector<float> rotation_columns;
+    std::vector<float> rotation_rows;
     std::vector<float> qjl_projection_rows;
     std::vector<float> cos_lut;
     std::vector<float> sin_lut;
@@ -434,10 +501,7 @@ public:
 
         state->encodePolar(rotated.data(), radii, angles.data());
         state->writeAngleCodes(angles.data(), encoded_angles);
-        *code_norm_sq = 0.0f;
-        for (size_t i = 0; i < state->pairs; ++i) {
-            *code_norm_sq += radii[i] * radii[i];
-        }
+        *code_norm_sq = SumSquares(radii, state->pairs);
 
         state->reconstructRotated(radii, angles.data(), reconstructed_rotated.data());
         state->applyInverseRotation(reconstructed_rotated.data(), reconstructed.data());
@@ -476,10 +540,7 @@ public:
         }
         state->projectQjl(normalized.data(), qjl_query_dots.data());
         state->buildQjlByteLookup(qjl_query_dots.data(), qjl_byte_lut);
-        *query_norm_sq = 0.0f;
-        for (float value : normalized) {
-            *query_norm_sq += value * value;
-        }
+        *query_norm_sq = SumSquares(normalized.data(), working_dim);
 
         input_blob_size = state->queryBlobSize();
     }
