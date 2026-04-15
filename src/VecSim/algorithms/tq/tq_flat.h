@@ -24,7 +24,6 @@
 #include <memory>
 #include <random>
 #include <stdexcept>
-#include <unordered_map>
 #include <vector>
 
 namespace TQFlatDetails {
@@ -134,11 +133,6 @@ struct StorageView {
 
 class TQModelState {
 public:
-    struct SymmetricQueryCache {
-        const void *query_blob = nullptr;
-        std::vector<float> polar_lookup;
-    };
-
     TQModelState(size_t dim, size_t total_bits, size_t projections, size_t seed, bool use_rotation)
         : dim(dim), pairs(PairCount(dim)), total_bits(total_bits), polar_bits(total_bits - 1),
           projections(projections), seed(seed), use_rotation(use_rotation),
@@ -365,42 +359,6 @@ public:
         }
     }
 
-    void cacheSymmetricQuery(const void *query_blob) const {
-        if (!usePolarLut()) {
-            return;
-        }
-
-        auto &cache = symmetricQueryCaches()[this];
-        cache.query_blob = query_blob;
-        cache.polar_lookup.resize(pairs * levels);
-
-        const auto query_storage = storageView(query_blob);
-        for (size_t pair_idx = 0; pair_idx < pairs; ++pair_idx) {
-            const float query_radius = query_storage.radii[pair_idx];
-            const size_t query_angle = angleCodeAt(query_storage, pair_idx);
-            float *pair_lookup = cache.polar_lookup.data() + pair_idx * levels;
-            for (size_t angle_idx = 0; angle_idx < levels; ++angle_idx) {
-                const size_t delta = (angle_idx - query_angle) & angle_delta_mask;
-                pair_lookup[angle_idx] = query_radius * delta_cos_lut[delta];
-            }
-        }
-    }
-
-    void clearCachedSymmetricQuery() const { symmetricQueryCaches().erase(this); }
-
-    const SymmetricQueryCache *getCachedSymmetricQuery(const void *query_blob) const {
-        UNUSED(query_blob);
-        if (!usePolarLut()) {
-            return nullptr;
-        }
-        auto &caches = symmetricQueryCaches();
-        auto it = caches.find(this);
-        if (it == caches.end()) {
-            return nullptr;
-        }
-        return &it->second;
-    }
-
     float estimateInnerProduct(const StorageView &storage, const QueryView &query) const {
         float polar_estimate = 0.0f;
         if (usePolarLut()) {
@@ -445,22 +403,6 @@ public:
         return polar_estimate + qjl_scale * static_cast<float>(sign_dot);
     }
 
-    float estimateInnerProductSymmetricQuery(const StorageView &storage,
-                                             const uint8_t *query_residual_signs,
-                                             const SymmetricQueryCache &query_cache) const {
-        float polar_estimate = 0.0f;
-        for (size_t i = 0; i < pairs; ++i) {
-            const uint16_t angle_index = angleCodeAt(storage, i);
-            polar_estimate +=
-                storage.radii[i] * query_cache.polar_lookup[i * levels + angle_index];
-        }
-
-        const int sign_dot =
-            PackedResidualSignDot(storage.residual_signs, query_residual_signs, projections);
-
-        return polar_estimate + qjl_scale * static_cast<float>(sign_dot);
-    }
-
     size_t dim;
     size_t pairs;
     size_t total_bits;
@@ -477,11 +419,6 @@ public:
     float qjl_scale;
 
 private:
-    static std::unordered_map<const TQModelState *, SymmetricQueryCache> &symmetricQueryCaches() {
-        static thread_local std::unordered_map<const TQModelState *, SymmetricQueryCache> caches;
-        return caches;
-    }
-
     void initializeRotation() {
         if (!use_rotation) {
             return;
@@ -602,13 +539,7 @@ public:
         UNUSED(dim);
         const auto lhs = state->storageView(v1);
         const auto rhs = state->storageView(v2);
-        float estimate = 0.0f;
-        if (const auto *query_cache = state->getCachedSymmetricQuery(v2)) {
-            estimate = state->estimateInnerProductSymmetricQuery(lhs, rhs.residual_signs,
-                                                                 *query_cache);
-        } else {
-            estimate = state->estimateInnerProductSymmetric(lhs, rhs);
-        }
+        const float estimate = state->estimateInnerProductSymmetric(lhs, rhs);
 
         if constexpr (Metric == VecSimMetric_L2) {
             return std::max(lhs.code_norm_sq + rhs.code_norm_sq - 2.0f * estimate, 0.0f);
@@ -744,7 +675,7 @@ class TQSymmetricPreprocessor : public PreprocessorInterface {
 public:
     TQSymmetricPreprocessor(std::shared_ptr<VecSimAllocator> allocator,
                             std::shared_ptr<TQModelState> state)
-        : PreprocessorInterface(allocator), state(state), delegate(allocator, std::move(state)) {}
+        : PreprocessorInterface(allocator), delegate(allocator, std::move(state)) {}
 
     void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
                     size_t &input_blob_size, unsigned char alignment) const override {
@@ -759,15 +690,12 @@ public:
                     size_t &storage_blob_size, size_t &query_blob_size,
                     unsigned char alignment) const override {
         UNUSED(alignment);
-        state->clearCachedSymmetricQuery();
         delegate.preprocessForStorage(original_blob, storage_blob, storage_blob_size);
         delegate.preprocessForStorage(original_blob, query_blob, query_blob_size);
-        state->cacheSymmetricQuery(query_blob);
     }
 
     void preprocessForStorage(const void *original_blob, void *&storage_blob,
                               size_t &input_blob_size) const override {
-        state->clearCachedSymmetricQuery();
         delegate.preprocessForStorage(original_blob, storage_blob, input_blob_size);
     }
 
@@ -775,16 +703,13 @@ public:
                          unsigned char alignment) const override {
         UNUSED(alignment);
         delegate.preprocessForStorage(original_blob, query_blob, input_blob_size);
-        state->cacheSymmetricQuery(query_blob);
     }
 
     void preprocessStorageInPlace(void *original_blob, size_t input_blob_size) const override {
-        state->clearCachedSymmetricQuery();
         delegate.preprocessStorageInPlace(original_blob, input_blob_size);
     }
 
 private:
-    std::shared_ptr<TQModelState> state;
     TQPreprocessor<Metric> delegate;
 };
 
