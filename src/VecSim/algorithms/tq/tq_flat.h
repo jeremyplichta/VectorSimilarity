@@ -389,13 +389,15 @@ public:
     void clearCachedSymmetricQuery() const { symmetricQueryCaches().erase(this); }
 
     const SymmetricQueryCache *getCachedSymmetricQuery(const void *query_blob) const {
-        UNUSED(query_blob);
         if (!usePolarLut()) {
             return nullptr;
         }
         auto &caches = symmetricQueryCaches();
         auto it = caches.find(this);
         if (it == caches.end()) {
+            return nullptr;
+        }
+        if (it->second.query_blob != query_blob) {
             return nullptr;
         }
         return &it->second;
@@ -603,8 +605,8 @@ public:
         const auto lhs = state->storageView(v1);
         const auto rhs = state->storageView(v2);
         float estimate = 0.0f;
-        if (const auto *query_cache = state->getCachedSymmetricQuery(v2)) {
-            estimate = state->estimateInnerProductSymmetricQuery(lhs, rhs.residual_signs,
+        if (const auto *query_cache = state->getCachedSymmetricQuery(v1)) {
+            estimate = state->estimateInnerProductSymmetricQuery(rhs, lhs.residual_signs,
                                                                  *query_cache);
         } else {
             estimate = state->estimateInnerProductSymmetric(lhs, rhs);
