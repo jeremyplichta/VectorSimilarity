@@ -113,7 +113,8 @@ OracleComparison CompareAgainstOracle(const tq_golden_fixture::OracleCase &oracl
     const auto query_view = state->queryView(query_blob);
     const float ip_estimate = state->estimateInnerProduct(storage_view, query_view);
     const float l2_estimate =
-        std::max(query_view.query_norm_sq + storage_view.code_norm_sq - 2.0f * ip_estimate, 0.0f);
+        std::max(query_view.query_norm_sq + storage_view.full_vector_norm_sq - 2.0f * ip_estimate,
+                 0.0f);
 
     allocator->free_allocation(storage_blob);
     allocator->free_allocation(query_blob);
@@ -123,6 +124,15 @@ OracleComparison CompareAgainstOracle(const tq_golden_fixture::OracleCase &oracl
         .l2_distance_estimate = l2_estimate,
         .code_norm_sq = storage_view.code_norm_sq,
     };
+}
+
+void SetStoredNorms(const std::shared_ptr<TQFlatDetails::TQModelState> &state, void *storage_blob,
+                    float full_vector_norm_sq, float code_norm_sq) {
+    auto *bytes = static_cast<uint8_t *>(storage_blob);
+    bytes += state->pairs * sizeof(float);
+    *reinterpret_cast<float *>(bytes) = full_vector_norm_sq;
+    bytes += sizeof(float);
+    *reinterpret_cast<float *>(bytes) = code_norm_sq;
 }
 
 std::vector<float> MakeSignal(size_t dim, float phase) {
@@ -468,6 +478,83 @@ TEST(TQFlatTest, l2_search_update_delete_and_size_estimation) {
     EXPECT_LT(VecSimIndex_EstimateElementSize(&params), raw_element_size);
 
     VecSimIndex_Free(index);
+}
+
+TEST(TQFlatTest, l2_asymmetric_distance_uses_full_storage_norm_field) {
+    constexpr size_t dim = 16;
+    auto allocator = VecSimAllocator::newVecsimAllocator();
+    auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, 8, 16, 17, true);
+    TQFlatDetails::TQPreprocessor<VecSimMetric_L2> preprocessor(allocator, state);
+    TQFlatDetails::TQDistanceCalculator<VecSimMetric_L2> calculator(allocator, state);
+
+    const auto vector = MakeSignal(dim, 0.23f);
+    const auto query = MakeSignal(dim, -0.41f);
+
+    void *storage_blob = nullptr;
+    size_t storage_blob_size = dim * sizeof(float);
+    preprocessor.preprocessForStorage(vector.data(), storage_blob, storage_blob_size);
+
+    void *query_blob = nullptr;
+    size_t query_blob_size = dim * sizeof(float);
+    preprocessor.preprocessQuery(query.data(), query_blob, query_blob_size, 0);
+
+    const auto original_storage = state->storageView(storage_blob);
+    const auto query_view = state->queryView(query_blob);
+    const float estimate = state->estimateInnerProduct(original_storage, query_view);
+    const float forced_full_norm = original_storage.full_vector_norm_sq + 11.0f;
+    const float forced_code_norm = original_storage.code_norm_sq * 0.25f + 0.5f;
+    SetStoredNorms(state, storage_blob, forced_full_norm, forced_code_norm);
+
+    const float actual = calculator.calcDistance(storage_blob, query_blob, dim);
+    const float expected =
+        std::max(query_view.query_norm_sq + forced_full_norm - 2.0f * estimate, 0.0f);
+    const float wrong =
+        std::max(query_view.query_norm_sq + forced_code_norm - 2.0f * estimate, 0.0f);
+
+    ASSERT_GT(std::abs(expected - wrong), 1e-3f);
+    EXPECT_NEAR(actual, expected, AllowedError(expected, 1e-5f, 1e-6f));
+
+    allocator->free_allocation(storage_blob);
+    allocator->free_allocation(query_blob);
+}
+
+TEST(TQFlatTest, l2_symmetric_distance_uses_full_storage_norm_fields) {
+    constexpr size_t dim = 16;
+    auto allocator = VecSimAllocator::newVecsimAllocator();
+    auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, 8, 16, 19, true);
+    TQFlatDetails::TQPreprocessor<VecSimMetric_L2> preprocessor(allocator, state);
+    TQFlatDetails::TQSymmetricDistanceCalculator<VecSimMetric_L2> calculator(allocator, state);
+
+    const auto lhs_vector = MakeSignal(dim, 0.11f);
+    const auto rhs_vector = MakeSignal(dim, -0.37f);
+
+    void *lhs_blob = nullptr;
+    size_t lhs_blob_size = dim * sizeof(float);
+    preprocessor.preprocessForStorage(lhs_vector.data(), lhs_blob, lhs_blob_size);
+
+    void *rhs_blob = nullptr;
+    size_t rhs_blob_size = dim * sizeof(float);
+    preprocessor.preprocessForStorage(rhs_vector.data(), rhs_blob, rhs_blob_size);
+
+    const auto lhs_view = state->storageView(lhs_blob);
+    const auto rhs_view = state->storageView(rhs_blob);
+    const float estimate = state->estimateInnerProductSymmetric(lhs_view, rhs_view);
+    const float lhs_full_norm = lhs_view.full_vector_norm_sq + 7.0f;
+    const float rhs_full_norm = rhs_view.full_vector_norm_sq + 9.0f;
+    const float lhs_code_norm = lhs_view.code_norm_sq * 0.1f + 0.25f;
+    const float rhs_code_norm = rhs_view.code_norm_sq * 0.2f + 0.5f;
+    SetStoredNorms(state, lhs_blob, lhs_full_norm, lhs_code_norm);
+    SetStoredNorms(state, rhs_blob, rhs_full_norm, rhs_code_norm);
+
+    const float actual = calculator.calcDistance(lhs_blob, rhs_blob, dim);
+    const float expected = std::max(lhs_full_norm + rhs_full_norm - 2.0f * estimate, 0.0f);
+    const float wrong = std::max(lhs_code_norm + rhs_code_norm - 2.0f * estimate, 0.0f);
+
+    ASSERT_GT(std::abs(expected - wrong), 1e-3f);
+    EXPECT_NEAR(actual, expected, AllowedError(expected, 1e-5f, 1e-6f));
+
+    allocator->free_allocation(lhs_blob);
+    allocator->free_allocation(rhs_blob);
 }
 
 TEST(TQFlatTest, range_query_returns_close_match) {

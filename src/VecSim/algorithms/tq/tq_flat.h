@@ -83,6 +83,7 @@ struct QueryView {
 
 struct StorageView {
     const float *radii;
+    float full_vector_norm_sq;
     float code_norm_sq;
     const void *angle_indices;
     const uint8_t *residual_signs;
@@ -127,7 +128,7 @@ public:
     }
 
     size_t storageBlobSize() const {
-        return pairs * sizeof(float) + sizeof(float) + angleCodeBytes() + packedQjlBytes();
+        return pairs * sizeof(float) + 2 * sizeof(float) + angleCodeBytes() + packedQjlBytes();
     }
 
     size_t queryBlobSize() const {
@@ -138,12 +139,15 @@ public:
         const auto *bytes = static_cast<const uint8_t *>(blob);
         const auto *radii = reinterpret_cast<const float *>(bytes);
         bytes += pairs * sizeof(float);
+        const auto *full_vector_norm_sq = reinterpret_cast<const float *>(bytes);
+        bytes += sizeof(float);
         const auto *code_norm_sq = reinterpret_cast<const float *>(bytes);
         bytes += sizeof(float);
         const void *angles = bytes;
         bytes += angleCodeBytes();
         const auto *signs = reinterpret_cast<const uint8_t *>(bytes);
         return {.radii = radii,
+                .full_vector_norm_sq = *full_vector_norm_sq,
                 .code_norm_sq = *code_norm_sq,
                 .angle_indices = angles,
                 .residual_signs = signs};
@@ -542,7 +546,8 @@ public:
         const float estimate = state->estimateInnerProduct(storage, query);
 
         if constexpr (Metric == VecSimMetric_L2) {
-            return std::max(query.query_norm_sq + storage.code_norm_sq - 2.0f * estimate, 0.0f);
+            return std::max(query.query_norm_sq + storage.full_vector_norm_sq - 2.0f * estimate,
+                            0.0f);
         }
 
         return 1.0f - estimate;
@@ -566,7 +571,8 @@ public:
         const float estimate = state->estimateInnerProductSymmetric(lhs, rhs);
 
         if constexpr (Metric == VecSimMetric_L2) {
-            return std::max(lhs.code_norm_sq + rhs.code_norm_sq - 2.0f * estimate, 0.0f);
+            return std::max(
+                lhs.full_vector_norm_sq + rhs.full_vector_norm_sq - 2.0f * estimate, 0.0f);
         }
 
         return 1.0f - estimate;
@@ -620,6 +626,8 @@ public:
         auto *bytes = static_cast<uint8_t *>(storage_blob);
         auto *radii = reinterpret_cast<float *>(bytes);
         bytes += state->pairs * sizeof(float);
+        auto *full_vector_norm_sq = reinterpret_cast<float *>(bytes);
+        bytes += sizeof(float);
         auto *code_norm_sq = reinterpret_cast<float *>(bytes);
         bytes += sizeof(float);
         void *encoded_angles = bytes;
@@ -628,6 +636,7 @@ public:
 
         state->encodePolar(rotated.data(), radii, angles.data());
         state->writeAngleCodes(angles.data(), encoded_angles);
+        *full_vector_norm_sq = state->sumSquares(normalized.data(), working_dim);
         *code_norm_sq = state->sumSquares(radii, state->pairs);
 
         state->reconstructRotated(radii, angles.data(), reconstructed_rotated.data());
