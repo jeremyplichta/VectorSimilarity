@@ -553,6 +553,11 @@ public:
         return 1.0f - estimate;
     }
 
+    // TQ distances require the model state captured in this calculator, so they cannot be
+    // expressed as a raw context-free function pointer. Returning nullptr makes the index
+    // fall back to the virtual calcDistance() path instead of the cached-pointer hot path.
+    spaces::dist_func_t<float> getDistFunc() const override { return nullptr; }
+
 private:
     std::shared_ptr<TQModelState> state;
 };
@@ -578,6 +583,9 @@ public:
         return 1.0f - estimate;
     }
 
+    // See TQDistanceCalculator::getDistFunc().
+    spaces::dist_func_t<float> getDistFunc() const override { return nullptr; }
+
 private:
     std::shared_ptr<TQModelState> state;
 };
@@ -590,25 +598,19 @@ public:
           state(std::move(state)), working_dim(this->state->dim) {}
 
     void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
-                    size_t &input_blob_size, unsigned char alignment) const override {
-        size_t storage_blob_size = input_blob_size;
-        size_t query_blob_size = input_blob_size;
-        preprocess(original_blob, storage_blob, query_blob, storage_blob_size, query_blob_size,
-                   alignment);
-        input_blob_size = storage_blob_size;
-    }
-
-    void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
                     size_t &storage_blob_size, size_t &query_blob_size,
-                    unsigned char alignment) const override {
-        preprocessForStorage(original_blob, storage_blob, storage_blob_size);
-        preprocessQuery(original_blob, query_blob, query_blob_size, alignment);
+                    unsigned char storage_alignment,
+                    unsigned char query_alignment) const override {
+        preprocessForStorage(original_blob, storage_blob, storage_blob_size, storage_alignment);
+        preprocessQuery(original_blob, query_blob, query_blob_size, query_alignment);
     }
 
     void preprocessForStorage(const void *original_blob, void *&storage_blob,
-                              size_t &input_blob_size) const override {
+                              size_t &input_blob_size,
+                              unsigned char storage_alignment) const override {
         if (!storage_blob) {
-            storage_blob = this->allocator->allocate(state->storageBlobSize());
+            storage_blob =
+                this->allocator->allocate_aligned(state->storageBlobSize(), storage_alignment);
         }
 
         const auto *typed_blob = static_cast<const float *>(original_blob);
@@ -687,7 +689,8 @@ public:
         std::vector<uint8_t> encoded(state->storageBlobSize());
         void *encoded_blob = encoded.data();
         size_t storage_blob_size = input_blob_size;
-        preprocessForStorage(original_blob, encoded_blob, storage_blob_size);
+        // encoded_blob is non-null, so no aligned allocation happens; alignment value is unused.
+        preprocessForStorage(original_blob, encoded_blob, storage_blob_size, 0);
         std::memcpy(original_blob, encoded.data(), state->storageBlobSize());
     }
 
@@ -711,31 +714,26 @@ public:
         : PreprocessorInterface(allocator), delegate(allocator, std::move(state)) {}
 
     void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
-                    size_t &input_blob_size, unsigned char alignment) const override {
-        size_t storage_blob_size = input_blob_size;
-        size_t query_blob_size = input_blob_size;
-        preprocess(original_blob, storage_blob, query_blob, storage_blob_size, query_blob_size,
-                   alignment);
-        input_blob_size = storage_blob_size;
-    }
-
-    void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
                     size_t &storage_blob_size, size_t &query_blob_size,
-                    unsigned char alignment) const override {
-        UNUSED(alignment);
-        delegate.preprocessForStorage(original_blob, storage_blob, storage_blob_size);
-        delegate.preprocessForStorage(original_blob, query_blob, query_blob_size);
+                    unsigned char storage_alignment,
+                    unsigned char query_alignment) const override {
+        delegate.preprocessForStorage(original_blob, storage_blob, storage_blob_size,
+                                      storage_alignment);
+        delegate.preprocessForStorage(original_blob, query_blob, query_blob_size,
+                                      query_alignment);
     }
 
     void preprocessForStorage(const void *original_blob, void *&storage_blob,
-                              size_t &input_blob_size) const override {
-        delegate.preprocessForStorage(original_blob, storage_blob, input_blob_size);
+                              size_t &input_blob_size,
+                              unsigned char storage_alignment) const override {
+        delegate.preprocessForStorage(original_blob, storage_blob, input_blob_size,
+                                      storage_alignment);
     }
 
     void preprocessQuery(const void *original_blob, void *&query_blob, size_t &input_blob_size,
-                         unsigned char alignment) const override {
-        UNUSED(alignment);
-        delegate.preprocessForStorage(original_blob, query_blob, input_blob_size);
+                         unsigned char query_alignment) const override {
+        delegate.preprocessForStorage(original_blob, query_blob, input_blob_size,
+                                      query_alignment);
     }
 
     void preprocessStorageInPlace(void *original_blob, size_t input_blob_size) const override {

@@ -103,7 +103,7 @@ OracleComparison CompareAgainstOracle(const tq_golden_fixture::OracleCase &oracl
 
     void *storage_blob = nullptr;
     size_t storage_blob_size = oracle_case.dim * sizeof(float);
-    preprocessor.preprocessForStorage(oracle_case.vector.data(), storage_blob, storage_blob_size);
+    preprocessor.preprocessForStorage(oracle_case.vector.data(), storage_blob, storage_blob_size, 0);
 
     void *query_blob = nullptr;
     size_t query_blob_size = oracle_case.dim * sizeof(float);
@@ -492,7 +492,7 @@ TEST(TQFlatTest, l2_asymmetric_distance_uses_full_storage_norm_field) {
 
     void *storage_blob = nullptr;
     size_t storage_blob_size = dim * sizeof(float);
-    preprocessor.preprocessForStorage(vector.data(), storage_blob, storage_blob_size);
+    preprocessor.preprocessForStorage(vector.data(), storage_blob, storage_blob_size, 0);
 
     void *query_blob = nullptr;
     size_t query_blob_size = dim * sizeof(float);
@@ -530,11 +530,11 @@ TEST(TQFlatTest, l2_symmetric_distance_uses_full_storage_norm_fields) {
 
     void *lhs_blob = nullptr;
     size_t lhs_blob_size = dim * sizeof(float);
-    preprocessor.preprocessForStorage(lhs_vector.data(), lhs_blob, lhs_blob_size);
+    preprocessor.preprocessForStorage(lhs_vector.data(), lhs_blob, lhs_blob_size, 0);
 
     void *rhs_blob = nullptr;
     size_t rhs_blob_size = dim * sizeof(float);
-    preprocessor.preprocessForStorage(rhs_vector.data(), rhs_blob, rhs_blob_size);
+    preprocessor.preprocessForStorage(rhs_vector.data(), rhs_blob, rhs_blob_size, 0);
 
     const auto lhs_view = state->storageView(lhs_blob);
     const auto rhs_view = state->storageView(rhs_blob);
@@ -740,7 +740,7 @@ TEST(TQFlatTest, asymmetric_estimate_matches_scalar_reference_for_compact_and_fa
 
             void *storage_blob = nullptr;
             size_t storage_blob_size = dim * sizeof(float);
-            preprocessor.preprocessForStorage(storage_vector.data(), storage_blob, storage_blob_size);
+            preprocessor.preprocessForStorage(storage_vector.data(), storage_blob, storage_blob_size, 0);
 
             void *query_blob = nullptr;
             size_t query_blob_size = dim * sizeof(float);
@@ -780,11 +780,11 @@ TEST(TQFlatTest, symmetric_estimate_matches_scalar_reference_for_compact_and_fal
 
             void *lhs_blob = nullptr;
             size_t lhs_blob_size = dim * sizeof(float);
-            preprocessor.preprocessForStorage(lhs_vector.data(), lhs_blob, lhs_blob_size);
+            preprocessor.preprocessForStorage(lhs_vector.data(), lhs_blob, lhs_blob_size, 0);
 
             void *rhs_blob = nullptr;
             size_t rhs_blob_size = dim * sizeof(float);
-            preprocessor.preprocessForStorage(rhs_vector.data(), rhs_blob, rhs_blob_size);
+            preprocessor.preprocessForStorage(rhs_vector.data(), rhs_blob, rhs_blob_size, 0);
 
             const auto lhs_view = state->storageView(lhs_blob);
             const auto rhs_view = state->storageView(rhs_blob);
@@ -842,11 +842,11 @@ TEST(TQFlatTest, symmetric_state_routing_matches_current_helper_selection) {
 
         void *lhs_blob = nullptr;
         size_t lhs_blob_size = dim * sizeof(float);
-        preprocessor.preprocessForStorage(lhs_vector.data(), lhs_blob, lhs_blob_size);
+        preprocessor.preprocessForStorage(lhs_vector.data(), lhs_blob, lhs_blob_size, 0);
 
         void *rhs_blob = nullptr;
         size_t rhs_blob_size = dim * sizeof(float);
-        preprocessor.preprocessForStorage(rhs_vector.data(), rhs_blob, rhs_blob_size);
+        preprocessor.preprocessForStorage(rhs_vector.data(), rhs_blob, rhs_blob_size, 0);
 
         const auto lhs_view = state->storageView(lhs_blob);
         const auto rhs_view = state->storageView(rhs_blob);
