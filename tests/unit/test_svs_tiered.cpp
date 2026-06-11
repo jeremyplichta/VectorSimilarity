@@ -2872,7 +2872,7 @@ TYPED_TEST(SVSTieredIndexTest, testInfo) {
     EXPECT_EQ(info.commonInfo.memory, info.tieredInfo.management_layer_memory +
                                           backendIndexInfo.commonInfo.memory +
                                           frontendIndexInfo.commonInfo.memory);
-    EXPECT_EQ(info.tieredInfo.backgroundIndexing, false);
+    EXPECT_EQ(info.tieredInfo.backgroundIndexing, VecSimBool_FALSE);
     // Validate tiered svs info fields
     EXPECT_EQ(info.tieredInfo.specificTieredBackendInfo.svsTieredInfo.trainingTriggerThreshold, 1);
     EXPECT_EQ(info.tieredInfo.specificTieredBackendInfo.svsTieredInfo.updateTriggerThreshold, 1);
@@ -2901,7 +2901,7 @@ TYPED_TEST(SVSTieredIndexTest, testInfo) {
     EXPECT_EQ(info.commonInfo.memory, info.tieredInfo.management_layer_memory +
                                           info.tieredInfo.backendCommonInfo.memory +
                                           info.tieredInfo.frontendCommonInfo.memory);
-    EXPECT_EQ(info.tieredInfo.backgroundIndexing, true);
+    EXPECT_EQ(info.tieredInfo.backgroundIndexing, VecSimBool_TRUE);
     EXPECT_EQ(info.tieredInfo.specificTieredBackendInfo.svsTieredInfo.indexUpdateScheduled, true);
 
     mock_thread_pool.thread_iteration();
@@ -2916,7 +2916,7 @@ TYPED_TEST(SVSTieredIndexTest, testInfo) {
     EXPECT_EQ(info.commonInfo.memory, info.tieredInfo.management_layer_memory +
                                           info.tieredInfo.backendCommonInfo.memory +
                                           info.tieredInfo.frontendCommonInfo.memory);
-    EXPECT_EQ(info.tieredInfo.backgroundIndexing, false);
+    EXPECT_EQ(info.tieredInfo.backgroundIndexing, VecSimBool_FALSE);
 
     if (TypeParam::isMulti()) {
         GenerateAndAddVector<TEST_DATA_T>(tiered_index, dim, 1, 1);
@@ -2931,7 +2931,7 @@ TYPED_TEST(SVSTieredIndexTest, testInfo) {
         EXPECT_EQ(info.commonInfo.memory, info.tieredInfo.management_layer_memory +
                                               info.tieredInfo.backendCommonInfo.memory +
                                               info.tieredInfo.frontendCommonInfo.memory);
-        EXPECT_EQ(info.tieredInfo.backgroundIndexing, true);
+        EXPECT_EQ(info.tieredInfo.backgroundIndexing, VecSimBool_TRUE);
     }
 
     VecSimIndex_DeleteVector(tiered_index, 1);
@@ -2946,7 +2946,7 @@ TYPED_TEST(SVSTieredIndexTest, testInfo) {
     EXPECT_EQ(info.commonInfo.memory, info.tieredInfo.management_layer_memory +
                                           info.tieredInfo.backendCommonInfo.memory +
                                           info.tieredInfo.frontendCommonInfo.memory);
-    EXPECT_EQ(info.tieredInfo.backgroundIndexing, false);
+    EXPECT_EQ(info.tieredInfo.backgroundIndexing, VecSimBool_FALSE);
 }
 
 TYPED_TEST(SVSTieredIndexTest, testInfoIterator) {
@@ -2970,7 +2970,9 @@ TYPED_TEST(SVSTieredIndexTest, testInfoIterator) {
     VecSimIndexDebugInfo frontendIndexInfo = tiered_index->GetFlatIndex()->debugInfo();
     VecSimIndexDebugInfo backendIndexInfo = tiered_index->GetBackendIndex()->debugInfo();
 
-    VecSimDebugInfoIterator *infoIterator = tiered_index->debugInfoIterator();
+    // Use the C API wrapper (as RediSearch does) so the process-wide SHARED_MEMORY
+    // field is appended at the top level — compareTieredIndexInfoToIterator expects it.
+    VecSimDebugInfoIterator *infoIterator = VecSimIndex_DebugInfoIterator(tiered_index);
     compareTieredIndexInfoToIterator(info, frontendIndexInfo, backendIndexInfo, infoIterator);
 
     VecSimDebugInfoIterator_Free(infoIterator);
@@ -3931,7 +3933,8 @@ TEST(SVSTieredIndexTest, testThreadPool) {
     // Test VecSimSVSThreadPool with shared pool
     const size_t num_threads = 4;
     VecSimSVSThreadPool::resize(num_threads);
-    VecSimSVSThreadPool pool;
+    auto allocator = VecSimAllocator::newVecsimAllocator();
+    VecSimSVSThreadPool pool{allocator};
     ASSERT_EQ(pool.poolSize(), num_threads);
     ASSERT_EQ(pool.size(), 1); // parallelism starts at 1 (calling thread)
     ASSERT_EQ(pool.getParallelism(), 1);
@@ -3974,7 +3977,7 @@ TEST(SVSTieredIndexTest, testThreadPool) {
 
     // Test write-in-place mode (pool with size 1)
     VecSimSVSThreadPool::resize(1);
-    VecSimSVSThreadPool inplace_pool;
+    VecSimSVSThreadPool inplace_pool{allocator};
     inplace_pool.setParallelism(1);
     ASSERT_EQ(inplace_pool.size(), 1);
     ASSERT_EQ(inplace_pool.poolSize(), 1);
@@ -3984,7 +3987,7 @@ TEST(SVSTieredIndexTest, testThreadPool) {
 
     // parallel_for works immediately with default parallelism 1
     VecSimSVSThreadPool::resize(num_threads);
-    VecSimSVSThreadPool default_pool;
+    VecSimSVSThreadPool default_pool{allocator};
     counter = 0;
     default_pool.parallel_for(task, 1);
     ASSERT_EQ(counter, 1); // 0+1 = 1

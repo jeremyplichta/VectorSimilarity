@@ -86,6 +86,7 @@ protected:
     RawDataContainer *vectors;      // The raw vectors data container.
 private:
     IndexCalculatorInterface<DistType> *indexCalculator; // Distance calculator.
+    spaces::dist_func_t<DistType> cachedDistFunc;        // Cached dist func, used on the hot path.
     PreprocessorsContainerAbstract *preprocessors;       // Storage and query preprocessors.
 
     size_t inputBlobSize; // The size of input vectors/queries blob in bytes. May differ from dim *
@@ -124,13 +125,22 @@ public:
           metric(params.metric),
           blockSize(params.blockSize ? params.blockSize : DEFAULT_BLOCK_SIZE), lastMode(EMPTY_MODE),
           isMulti(params.multi), isDisk(params.isDisk), logCallbackCtx(params.logCtx),
-          indexCalculator(components.indexCalculator), preprocessors(components.preprocessors),
-          inputBlobSize(params.inputBlobSize), storedDataSize(params.storedDataSize) {
+          indexCalculator(components.indexCalculator),
+          cachedDistFunc(components.indexCalculator ? components.indexCalculator->getDistFunc()
+                                                    : nullptr),
+          preprocessors(components.preprocessors), inputBlobSize(params.inputBlobSize),
+          storedDataSize(params.storedDataSize) {
         assert(VecSimType_sizeof(vecType));
         assert(storedDataSize);
         assert(inputBlobSize);
+        // DataBlocksContainer holds the persistent storage vectors, so it must honor the storage
+        // alignment hint (not the query alignment). Note: this only aligns the base address of
+        // each block; vectors inside a block are packed back-to-back at stride `storedDataSize`,
+        // so only the first vector in every block is guaranteed to be aligned. Aligning every
+        // vector would require padding `storedDataSize` up to a multiple of the alignment, which
+        // is a separate change.
         this->vectors = new (this->allocator) DataBlocksContainer(
-            this->blockSize, this->storedDataSize, this->allocator, this->getAlignment());
+            this->blockSize, this->storedDataSize, this->allocator, this->getStorageAlignment());
     }
 
     /**
@@ -146,10 +156,16 @@ public:
     /**
      * @brief Calculate the distance between two vectors based on index parameters.
      *
+     * Uses the cached dist func to avoid the indexCalculator vtable on the hot path.
+     *
+     * @note Precondition: @c cachedDistFunc must be non-null. Subclasses that construct
+     *       this index with a null @c indexCalculator (e.g. SVS, which uses its own
+     *       internal distance kernels) must not call this method.
+     *
      * @return the distance between the vectors.
      */
     DistType calcDistance(const void *vector_data1, const void *vector_data2) const {
-        return indexCalculator->calcDistance(vector_data1, vector_data2, this->dim);
+        return cachedDistFunc(vector_data1, vector_data2, this->dim);
     }
 
     /**
@@ -192,7 +208,8 @@ public:
     inline size_t getStoredDataSize() const { return storedDataSize; }
     inline size_t getInputBlobSize() const { return inputBlobSize; }
     inline size_t getBlockSize() const { return blockSize; }
-    inline auto getAlignment() const { return this->preprocessors->getAlignment(); }
+    inline auto getQueryAlignment() const { return this->preprocessors->getQueryAlignment(); }
+    inline auto getStorageAlignment() const { return this->preprocessors->getStorageAlignment(); }
 
     virtual inline VecSimIndexStatsInfo statisticInfo() const override {
         return VecSimIndexStatsInfo{
@@ -296,6 +313,10 @@ public:
     IndexComponents<DataType, DistType> get_components() const {
         return {.indexCalculator = this->indexCalculator, .preprocessors = this->preprocessors};
     }
+
+    // Test-only: override the disk flag to exercise disk-specific param resolution
+    // without requiring an actual disk-based index implementation.
+    void setIsDiskForTesting(bool v) { this->isDisk = v; }
 
     /**
      * @brief Used for testing - get only the vector elements associated with a given label.

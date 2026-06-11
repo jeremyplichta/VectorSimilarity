@@ -19,9 +19,12 @@
 #include "VecSim/spaces/functions/AVX512FP16_VL.h"
 #include "VecSim/spaces/functions/AVX512F_BW_VL_VNNI.h"
 #include "VecSim/spaces/functions/AVX2.h"
+#include "VecSim/spaces/functions/AVX2_F16C.h"
 #include "VecSim/spaces/functions/AVX2_FMA.h"
+#include "VecSim/spaces/functions/AVX2_FMA_F16C.h"
 #include "VecSim/spaces/functions/SSE3.h"
 #include "VecSim/spaces/functions/SSE4.h"
+#include "VecSim/spaces/functions/SSE4_F16C.h"
 #include "VecSim/spaces/functions/NEON.h"
 #include "VecSim/spaces/functions/NEON_DOTPROD.h"
 #include "VecSim/spaces/functions/NEON_HP.h"
@@ -70,27 +73,112 @@ dist_func_t<float> L2_SQ8_FP32_GetDistFunc(size_t dim, unsigned char *alignment,
     if (dim < 16) {
         return ret_dist_func;
     }
+    // Alignment hints below refer to the SQ8 (first) operand per the GetDistFunc contract.
 #ifdef OPT_AVX512_F_BW_VL_VNNI
     if (features.avx512f && features.avx512bw && features.avx512vnni) {
+        if (dim % 16 == 0) // SQ8 chunk = 16 bytes; no point in aligning if there's a residual
+            *alignment = 16 * sizeof(uint8_t);
         return Choose_SQ8_FP32_L2_implementation_AVX512F_BW_VL_VNNI(dim);
     }
 #endif
 #ifdef OPT_AVX2_FMA
     if (features.avx2 && features.fma3) {
+        if (dim % 8 == 0) // SQ8 chunk = 8 bytes
+            *alignment = 8 * sizeof(uint8_t);
         return Choose_SQ8_FP32_L2_implementation_AVX2_FMA(dim);
     }
 #endif
 #ifdef OPT_AVX2
     if (features.avx2) {
+        if (dim % 8 == 0) // SQ8 chunk = 8 bytes
+            *alignment = 8 * sizeof(uint8_t);
         return Choose_SQ8_FP32_L2_implementation_AVX2(dim);
     }
 #endif
 #ifdef OPT_SSE4
     if (features.sse4_1) {
+        if (dim % 4 == 0) // SQ8 chunk = 4 bytes
+            *alignment = 4 * sizeof(uint8_t);
         return Choose_SQ8_FP32_L2_implementation_SSE4(dim);
     }
 #endif
 #endif // __x86_64__
+    return ret_dist_func;
+}
+
+// SQ8-FP16: asymmetric L2 distance between SQ8 storage and FP16 query.
+dist_func_t<float> L2_SQ8_FP16_GetDistFunc(size_t dim, unsigned char *alignment,
+                                           const void *arch_opt) {
+    unsigned char dummy_alignment;
+    if (!alignment) {
+        alignment = &dummy_alignment;
+    }
+
+    dist_func_t<float> ret_dist_func = SQ8_FP16_L2Sqr;
+    [[maybe_unused]] auto features = getCpuOptimizationFeatures(arch_opt);
+
+#ifdef CPU_FEATURES_ARCH_X86_64
+    if (dim < 16) {
+        return ret_dist_func;
+    }
+    // Alignment hints below refer to the SQ8 (first) operand per the GetDistFunc contract.
+    // AVX-512 tier only needs AVX-512F (cvtph_ps is part of AVX-512F, no VNNI/BW/VL required).
+#ifdef OPT_AVX512F
+    if (features.avx512f) {
+        if (dim % 16 == 0)
+            *alignment = 16 * sizeof(uint8_t);
+        return Choose_SQ8_FP16_L2_implementation_AVX512F(dim);
+    }
+#endif
+    // F16C is required by every non-AVX-512 SQ8↔FP16 tier (vcvtph2ps), so the guard is hoisted
+    // around all three.
+#ifdef OPT_F16C
+#ifdef OPT_AVX2_FMA
+    if (features.avx2 && features.fma3 && features.f16c) {
+        if (dim % 8 == 0)
+            *alignment = 8 * sizeof(uint8_t);
+        return Choose_SQ8_FP16_L2_implementation_AVX2_FMA(dim);
+    }
+#endif
+#ifdef OPT_AVX2
+    if (features.avx2 && features.f16c) {
+        if (dim % 8 == 0)
+            *alignment = 8 * sizeof(uint8_t);
+        return Choose_SQ8_FP16_L2_implementation_AVX2(dim);
+    }
+#endif
+#ifdef OPT_SSE4
+    if (features.sse4_1 && features.f16c && features.avx) {
+        if (dim % 4 == 0)
+            *alignment = 4 * sizeof(uint8_t);
+        return Choose_SQ8_FP16_L2_implementation_SSE4(dim);
+    }
+#endif
+#endif // OPT_F16C
+#endif // x86_64
+#ifdef CPU_FEATURES_ARCH_AARCH64
+    if (dim < 16) {
+        return ret_dist_func;
+    }
+#ifdef OPT_SVE2
+    if (features.sve2) {
+        return Choose_SQ8_FP16_L2_implementation_SVE2(dim);
+    }
+#endif
+#ifdef OPT_SVE
+    if (features.sve) {
+        return Choose_SQ8_FP16_L2_implementation_SVE(dim);
+    }
+#endif
+#ifdef OPT_NEON_HP
+    if (features.asimdfhm) {
+        return Choose_SQ8_FP16_L2_implementation_NEON_FHM(dim);
+    }
+    if (features.asimdhp) {
+        return Choose_SQ8_FP16_L2_implementation_NEON_HP(dim);
+    }
+#endif
+#endif // CPU_FEATURES_ARCH_AARCH64
     return ret_dist_func;
 }
 
@@ -456,8 +544,10 @@ dist_func_t<float> L2_SQ8_SQ8_GetDistFunc(size_t dim, unsigned char *alignment,
 
 #ifdef CPU_FEATURES_ARCH_X86_64
 #ifdef OPT_AVX512_F_BW_VL_VNNI
-    // AVX512 VNNI SQ8_SQ8 uses 64-element chunks
+    // AVX512 VNNI SQ8_SQ8 uses 64-element chunks; residual handling is in 32-byte sub-chunks.
     if (dim >= 64 && features.avx512f && features.avx512bw && features.avx512vnni) {
+        if (dim % 32 == 0) // align to 256 bits when there is no offsetting residual
+            *alignment = 32 * sizeof(uint8_t);
         return Choose_SQ8_SQ8_L2_implementation_AVX512F_BW_VL_VNNI(dim);
     }
 #endif

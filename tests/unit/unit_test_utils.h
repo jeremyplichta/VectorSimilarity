@@ -11,6 +11,7 @@
 
 #include <functional>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <thread>
 
@@ -185,16 +186,25 @@ void compareSVSInfo(svsInfoStruct info1, svsInfoStruct info2);
 
 void validateSVSIndexAttributesInfo(svsInfoStruct info, SVSParams params);
 
-void compareFlatIndexInfoToIterator(VecSimIndexDebugInfo info, VecSimDebugInfoIterator *infoIter);
+// When called with a C API iterator (VecSimIndex_DebugInfoIterator), pass the
+// default expect_shared_memory=true so the SHARED_MEMORY field is accounted for.
+// Pass false when comparing nested sub-iterators built by the C++ debugInfoIterator()
+// method directly (e.g. inside compareTieredIndexInfoToIterator).
+void compareFlatIndexInfoToIterator(VecSimIndexDebugInfo info, VecSimDebugInfoIterator *infoIter,
+                                    bool expect_shared_memory = true);
 
-void compareHNSWIndexInfoToIterator(VecSimIndexDebugInfo info, VecSimDebugInfoIterator *infoIter);
+void compareHNSWIndexInfoToIterator(VecSimIndexDebugInfo info, VecSimDebugInfoIterator *infoIter,
+                                    bool expect_shared_memory = true);
 
 void compareTieredIndexInfoToIterator(VecSimIndexDebugInfo info,
                                       VecSimIndexDebugInfo frontendIndexInfo,
                                       VecSimIndexDebugInfo backendIndexInfo,
                                       VecSimDebugInfoIterator *infoIterator);
 
-void compareSVSIndexInfoToIterator(VecSimIndexDebugInfo info, VecSimDebugInfoIterator *infoIter);
+#if HAVE_SVS
+void compareSVSIndexInfoToIterator(VecSimIndexDebugInfo info, VecSimDebugInfoIterator *infoIter,
+                                   bool expect_shared_memory = true);
+#endif
 
 void runRangeQueryTest(VecSimIndex *index, const void *query, double radius,
                        const std::function<void(size_t, double, size_t)> &ResCB,
@@ -250,12 +260,10 @@ inline void ComputeSQ8Quantization(const float *original_blob, size_t dim, uint8
         sum_squares += original_blob[i] * original_blob[i];
     }
 
-    // Store metadata: min_val, delta, sum, sum_squares
-    float *metadata = reinterpret_cast<float *>(output + dim);
-    metadata[sq8::MIN_VAL] = min_val;
-    metadata[sq8::DELTA] = delta;
-    metadata[sq8::SUM] = sum;
-    metadata[sq8::SUM_SQUARES] = sum_squares;
+    // Store metadata: min_val, delta, sum, sum_squares. Use memcpy because the metadata region
+    // (output + dim) is not guaranteed to be 4-byte aligned for arbitrary dim values.
+    const float metadata[4] = {min_val, delta, sum, sum_squares};
+    std::memcpy(output + dim, metadata, sizeof(metadata));
 }
 
 // TODO: Move all test_utils to this namespace
