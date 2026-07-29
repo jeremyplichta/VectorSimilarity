@@ -416,6 +416,41 @@ TEST(TQFlatTest, cosine_search_prefers_exact_match) {
     VecSimIndex_Free(index);
 }
 
+TEST(TQFlatTest, cosine_scores_use_standard_one_minus_cosine_scale) {
+    VecSimParams params = CreateTQParams(16, VecSimMetric_Cosine, 7, true, 8, 256);
+    VecSimIndex *index = VecSimIndex_New(&params);
+    ASSERT_NE(index, nullptr);
+
+    const float e1[16] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const float e2[16] = {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const float negative_e1[16] = {-1, 0, 0, 0, 0, 0, 0, 0,
+                                   0,  0, 0, 0, 0, 0, 0, 0};
+
+    ASSERT_EQ(VecSimIndex_AddVector(index, e1, 1), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, e2, 2), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, negative_e1, 3), 1);
+
+    auto results = TopK(index, e1, 3);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_EQ(results[0].first, 1U);
+    EXPECT_EQ(results[1].first, 2U);
+    EXPECT_EQ(results[2].first, 3U);
+    EXPECT_NEAR(results[0].second, 0.0, 0.1);
+    EXPECT_NEAR(results[1].second, 1.0, 0.1);
+    EXPECT_NEAR(results[2].second, 2.0, 0.1);
+
+    auto close_results = Range(index, e1, 0.5);
+    ASSERT_EQ(close_results.size(), 1);
+    EXPECT_EQ(close_results[0].first, 1U);
+
+    auto non_opposite_results = Range(index, e1, 1.5);
+    ASSERT_EQ(non_opposite_results.size(), 2);
+    EXPECT_EQ(non_opposite_results[0].first, 1U);
+    EXPECT_EQ(non_opposite_results[1].first, 2U);
+
+    VecSimIndex_Free(index);
+}
+
 TEST(TQFlatTest, tq_hnsw_cosine_search_prefers_exact_match) {
     VecSimParams params = CreateTQHNSWParams(16, VecSimMetric_Cosine, 7, true, 8, 64);
     VecSimIndex *index = VecSimIndex_New(&params);
@@ -722,6 +757,7 @@ TEST(TQFlatTest, asymmetric_estimate_matches_scalar_reference_for_compact_and_fa
     };
 
     const std::vector<EstimateCase> cases = {
+        {.bits = 2, .expect_compact_angles = true, .expect_polar_lookup = true},
         {.bits = 4, .expect_compact_angles = true, .expect_polar_lookup = true},
         {.bits = 7, .expect_compact_angles = true, .expect_polar_lookup = true},
         {.bits = 9, .expect_compact_angles = true, .expect_polar_lookup = true},
@@ -768,7 +804,7 @@ TEST(TQFlatTest, symmetric_estimate_matches_scalar_reference_for_compact_and_fal
     const auto rhs_vector = MakeSignal(dim, -0.47f);
 
     for (size_t projections : {size_t{13}, size_t{257}}) {
-        for (size_t bits : {size_t{4}, size_t{5}, size_t{7}, size_t{9}, size_t{10}}) {
+        for (size_t bits : {size_t{2}, size_t{4}, size_t{5}, size_t{7}, size_t{9}, size_t{10}}) {
             SCOPED_TRACE(testing::Message() << "bits=" << bits << " projections=" << projections);
 
             auto allocator = VecSimAllocator::newVecsimAllocator();
