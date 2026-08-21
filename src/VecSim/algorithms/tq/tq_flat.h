@@ -153,7 +153,7 @@ public:
         } else {
             // sign(0) is +1. The signs are ignored because gamma is zero, but keeping the
             // canonical mathematical value makes byte-level tests unambiguous.
-            std::memset(signs, 0xFF, state->packedQjlBytes());
+            state->packResidualSigns(residual.data(), signs);
         }
 
         const float source_scale = Metric == VecSimMetric_Cosine ? 1.0f : original_norm;

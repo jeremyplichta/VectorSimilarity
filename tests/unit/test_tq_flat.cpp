@@ -198,6 +198,17 @@ TEST(TQPaperConformanceTest, zero_vector_has_exact_zero_score_and_metadata) {
     EXPECT_FLOAT_EQ(encoded.state->estimateInnerProduct(storage, query_view), 0.0f);
 }
 
+TEST(TQPaperConformanceTest, zero_residual_has_positive_signs_and_clear_tail_bits) {
+    constexpr size_t dim = 10;
+    TQFlatDetails::TQModelState state(dim, 4, dim, 9, false);
+    const std::array<float, dim> zero_residual = {};
+    std::array<uint8_t, 2> signs = {0xFF, 0xFF};
+    state.packResidualSigns(zero_residual.data(), signs.data());
+
+    EXPECT_EQ(signs[0], 0xFF);
+    EXPECT_EQ(signs[1], 0x03);
+}
+
 TEST(TQPaperConformanceTest, asymmetric_estimator_matches_algorithm_two_equation) {
     constexpr size_t dim = 8;
     const std::array<float, dim> vector = {1.2f, -0.4f, 0.2f, 0.7f, 0.1f, 0.3f, -0.8f, 0.5f};
