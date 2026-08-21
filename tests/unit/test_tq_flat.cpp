@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <span>
@@ -276,6 +277,36 @@ TEST(TQPaperConformanceTest, stored_to_stored_distance_matches_explicit_algorith
     EXPECT_NEAR(calculator.calcDistance(lhs_blob, rhs_blob, dim), expected, 1e-6f);
     allocator->free_allocation(lhs_blob);
     allocator->free_allocation(rhs_blob);
+}
+
+TEST(TQPaperConformanceTest, simd_matches_scalar_for_bit_widths_tails_and_unaligned_storage) {
+    for (size_t dim :
+         {size_t{2}, size_t{3}, size_t{7}, size_t{8}, size_t{15}, size_t{16}, size_t{31}}) {
+        for (size_t bits : {size_t{2}, size_t{4}, size_t{8}}) {
+            for (size_t seed = 1; seed <= 12; ++seed) {
+                SCOPED_TRACE(::testing::Message()
+                             << "dim=" << dim << " bits=" << bits << " seed=" << seed);
+                std::vector<float> vector(dim);
+                std::vector<float> query(dim);
+                for (size_t i = 0; i < dim; ++i) {
+                    vector[i] = std::sin(static_cast<float>((i + 1) * (seed + 3)) * 0.271f) *
+                                static_cast<float>(seed + 1);
+                    query[i] = std::cos(static_cast<float>((i + 2) * (seed + 5)) * 0.193f);
+                }
+
+                EncodedPair<VecSimMetric_IP> encoded(dim, bits, seed, true, vector.data(),
+                                                     query.data());
+                std::vector<uint8_t> unaligned(encoded.state->storageBlobSize() + 1);
+                std::memcpy(unaligned.data() + 1, encoded.storage,
+                            encoded.state->storageBlobSize());
+                const auto storage = encoded.state->storageView(unaligned.data() + 1);
+                const auto query_view = encoded.state->queryView(encoded.query);
+                const float scalar = encoded.state->estimateInnerProductScalar(storage, query_view);
+                const float simd = encoded.state->estimateInnerProduct(storage, query_view);
+                EXPECT_NEAR(simd, scalar, 2e-5f * std::max(std::abs(scalar), 1.0f));
+            }
+        }
+    }
 }
 
 TEST(TQFlatTest, non_unit_inner_product_vectors_preserve_magnitude) {

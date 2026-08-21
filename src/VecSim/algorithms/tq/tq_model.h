@@ -19,6 +19,12 @@
 #include <utility>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 namespace TQFlatDetails {
 
 inline constexpr uint64_t kQjlSeedOffset = 0xCAFEBABE00000001ULL;
@@ -57,6 +63,14 @@ inline float DotProductScalar(const float *lhs, const float *rhs, size_t dim) {
 
 inline float SumSquaresScalar(const float *values, size_t dim) {
     return DotProductScalar(values, values, dim);
+}
+
+inline constexpr bool HasPaperTqSimd() {
+#if defined(__aarch64__) || defined(__SSE2__)
+    return true;
+#else
+    return false;
+#endif
 }
 
 // SplitMix64 plus an explicit Box-Muller transform makes model generation independent of the
@@ -351,7 +365,7 @@ public:
         }
     }
 
-    float estimateInnerProduct(const StorageView &storage, const QueryView &query) const {
+    float estimateInnerProductScalar(const StorageView &storage, const QueryView &query) const {
         if (storage.source_scale == 0.0f) {
             return 0.0f;
         }
@@ -368,6 +382,20 @@ public:
                 residual += query.qjl_projection[projection] * sign;
             }
             residual *= storage.residual_norm * qjl_scale;
+        }
+        return storage.source_scale * (coarse + residual);
+    }
+
+    float estimateInnerProduct(const StorageView &storage, const QueryView &query) const {
+        if (storage.source_scale == 0.0f) {
+            return 0.0f;
+        }
+
+        const float coarse = packedCentroidDotSimd(storage, query.rotated);
+        float residual = 0.0f;
+        if (storage.residual_norm != 0.0f) {
+            residual = packedSignDotSimd(storage, query.qjl_projection) * storage.residual_norm *
+                       qjl_scale;
         }
         return storage.source_scale * (coarse + residual);
     }
@@ -414,6 +442,81 @@ public:
     std::vector<float> boundaries;
 
 private:
+    float packedCentroidDotSimd(const StorageView &storage, const float *query) const {
+#if defined(__aarch64__)
+        float32x4_t accumulator = vdupq_n_f32(0.0f);
+        size_t coordinate = 0;
+        alignas(16) float centroid_lanes[4];
+        for (; coordinate + 4 <= dim; coordinate += 4) {
+            for (size_t lane = 0; lane < 4; ++lane) {
+                centroid_lanes[lane] = centroids[mseIndexAt(storage, coordinate + lane)];
+            }
+            accumulator = vaddq_f32(
+                accumulator, vmulq_f32(vld1q_f32(query + coordinate), vld1q_f32(centroid_lanes)));
+        }
+        float sum = vaddvq_f32(accumulator);
+#elif defined(__SSE2__)
+        __m128 accumulator = _mm_setzero_ps();
+        size_t coordinate = 0;
+        alignas(16) float centroid_lanes[4];
+        for (; coordinate + 4 <= dim; coordinate += 4) {
+            for (size_t lane = 0; lane < 4; ++lane) {
+                centroid_lanes[lane] = centroids[mseIndexAt(storage, coordinate + lane)];
+            }
+            accumulator = _mm_add_ps(accumulator, _mm_mul_ps(_mm_loadu_ps(query + coordinate),
+                                                             _mm_load_ps(centroid_lanes)));
+        }
+        alignas(16) float partial[4];
+        _mm_store_ps(partial, accumulator);
+        float sum = partial[0] + partial[1] + partial[2] + partial[3];
+#else
+        size_t coordinate = 0;
+        float sum = 0.0f;
+#endif
+        for (; coordinate < dim; ++coordinate) {
+            sum += query[coordinate] * centroids[mseIndexAt(storage, coordinate)];
+        }
+        return sum;
+    }
+
+    float packedSignDotSimd(const StorageView &storage, const float *query) const {
+#if defined(__aarch64__)
+        float32x4_t accumulator = vdupq_n_f32(0.0f);
+        size_t projection = 0;
+        alignas(16) float sign_lanes[4];
+        for (; projection + 4 <= projections; projection += 4) {
+            for (size_t lane = 0; lane < 4; ++lane) {
+                sign_lanes[lane] = residualSignAt(storage, projection + lane) ? 1.0f : -1.0f;
+            }
+            accumulator = vaddq_f32(
+                accumulator, vmulq_f32(vld1q_f32(query + projection), vld1q_f32(sign_lanes)));
+        }
+        float sum = vaddvq_f32(accumulator);
+#elif defined(__SSE2__)
+        __m128 accumulator = _mm_setzero_ps();
+        size_t projection = 0;
+        alignas(16) float sign_lanes[4];
+        for (; projection + 4 <= projections; projection += 4) {
+            for (size_t lane = 0; lane < 4; ++lane) {
+                sign_lanes[lane] = residualSignAt(storage, projection + lane) ? 1.0f : -1.0f;
+            }
+            accumulator = _mm_add_ps(
+                accumulator, _mm_mul_ps(_mm_loadu_ps(query + projection), _mm_load_ps(sign_lanes)));
+        }
+        alignas(16) float partial[4];
+        _mm_store_ps(partial, accumulator);
+        float sum = partial[0] + partial[1] + partial[2] + partial[3];
+#else
+        size_t projection = 0;
+        float sum = 0.0f;
+#endif
+        for (; projection < projections; ++projection) {
+            const float sign = residualSignAt(storage, projection) ? 1.0f : -1.0f;
+            sum += query[projection] * sign;
+        }
+        return sum;
+    }
+
     void initializeRotation() {
         if (!use_rotation) {
             for (size_t i = 0; i < dim; ++i) {
