@@ -154,11 +154,11 @@ codec version. Standalone VecSim TQ-HNSW file serialization remains unsupported 
 is represented in its serializer.
 
 RediSearch RDB persists vector-field parameters and source Redis documents, then rebuilds the
-in-memory index. The RediSearch encoding version will be advanced. Loading the historical TQ
-encoding migrates to the paper codec by forcing `m = d`, the paper codec version, and deterministic
-model defaults before rebuilding from source documents; historical `d/2` projection values must
-not be reinterpreted as paper-faithful settings. New saves persist the codec version explicitly.
-Round-trip tests compare configuration, ordering, and scores before and after reload.
+in-memory index. Encoding version 29 stores paper codec marker 2 explicitly. The historical
+version-28 pairwise-polar encoding is rejected: its parameter shape looks compatible, but its
+`d/2` projection value and vector-byte contract must never be reinterpreted as paper-faithful
+settings. Older non-TQ encodings remain loadable. Round-trip tests compare configuration,
+ordering, and scores before and after reload.
 
 Golden fixtures are regenerated from an independent, paper-derived scalar implementation. The
 pairwise-polar Rust oracle is removed from conformance authority and retained only if a historical

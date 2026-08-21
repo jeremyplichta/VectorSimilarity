@@ -82,7 +82,7 @@ TEST(TQHNSWTieredIndexTest, background_insert_moves_raw_vector_into_quantized_ba
         .initialCapacity = 0,
         .blockSize = 4,
         .bits = 8,
-        .projections = 64,
+        .projections = 16,
         .seed = 7,
         .useRotation = true,
         .M = 16,
