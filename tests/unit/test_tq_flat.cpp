@@ -12,6 +12,7 @@
 #include "VecSim/algorithms/hnsw/hnsw_serializer.h"
 #include "VecSim/algorithms/tq/tq_flat.h"
 #include "VecSim/vec_sim.h"
+#include "tq_paper_reference.h"
 #include "tq_golden_fixture.h"
 
 #include <cmath>
@@ -21,6 +22,39 @@
 #include <vector>
 
 namespace {
+
+TEST(TQPaperReferenceTest, exact_one_bit_codebook_is_symmetric) {
+    const auto [negative, positive] = tq_paper_reference::ExactOneBitCentroids(8);
+    EXPECT_LT(negative, 0.0f);
+    EXPECT_GT(positive, 0.0f);
+    EXPECT_FLOAT_EQ(negative, -positive);
+    EXPECT_FLOAT_EQ((negative + positive) / 2.0f, 0.0f);
+}
+
+TEST(TQPaperReferenceTest, qjl_correction_owns_residual_magnitude) {
+    const std::vector<float> projected_query = {1.0f, -2.0f, 0.5f, 3.0f};
+    const std::vector<int8_t> residual_signs = {1, -1, -1, 1};
+
+    const float unit = tq_paper_reference::QjlCorrection(1.0f, projected_query, residual_signs);
+    const float scaled = tq_paper_reference::QjlCorrection(0.125f, projected_query, residual_signs);
+
+    EXPECT_FLOAT_EQ(scaled, unit * 0.125f);
+}
+
+TEST(TQPaperConformanceTest, stored_payload_matches_advertised_total_bit_budget) {
+    EXPECT_EQ(tq_paper_reference::StorageBytes(1024, 2), 264);
+    EXPECT_EQ(tq_paper_reference::StorageBytes(1024, 4), 520);
+    EXPECT_EQ(tq_paper_reference::StorageBytes(1024, 8), 1032);
+
+    // Keep the production-model construction small: the reference branch still builds a dense
+    // rotation matrix in its constructor. The same byte formula is dimension-independent.
+    constexpr size_t dim = 64;
+    for (size_t bits : {size_t{2}, size_t{4}, size_t{8}}) {
+        TQFlatDetails::TQModelState state(dim, bits, dim, 7, true);
+        EXPECT_EQ(state.storageBlobSize(), tq_paper_reference::StorageBytes(dim, bits))
+            << "TQ" << bits << " must not retain pairwise FP32 radii";
+    }
+}
 
 VecSimParams CreateTQParams(size_t dim, VecSimMetric metric, size_t seed = 7,
                             bool use_rotation = true, size_t bits = 8, size_t projections = 0) {
