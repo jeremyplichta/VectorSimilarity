@@ -34,7 +34,7 @@ private:
             if (VECSIM_TIMEOUT(this->getTimeoutCtx())) {
                 return VecSim_QueryReply_TimedOut;
             }
-            auto score = this->index->calcDistance(vector, this->getQueryBlob());
+            auto score = this->index->calcDistanceForQuery(vector, this->getQueryBlob());
             labelType curr_label = this->index->getVectorLabel(curr_id);
             auto curr_pair = tmp_scores.find(curr_label);
             // For each score, emplace or update the score of the label.

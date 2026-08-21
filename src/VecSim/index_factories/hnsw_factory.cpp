@@ -246,18 +246,21 @@ size_t EstimateElementSize(const HNSWParams *params) {
 
 template <VecSimMetric Metric>
 size_t EstimateTQInitialSizeImpl(const TQHNSWParams *params) {
-    TQFlatDetails::PolarBits(params->bits);
-    TQFlatDetails::QjlScale(params->projections);
+    const size_t mse_bits = TQFlatDetails::MseBits(params->bits);
+    if (params->projections != params->dim) {
+        throw std::invalid_argument("Paper-faithful TurboQuant requires projections == dim");
+    }
     size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
     size_t est = sizeof(VecSimAllocator) + allocations_overhead;
     est += params->multi ? sizeof(TQHNSWDetails::TQHNSWIndex_Multi<float, float>)
                          : sizeof(TQHNSWDetails::TQHNSWIndex_Single<float, float>);
-    est += allocations_overhead + sizeof(TQFlatDetails::TQSymmetricDistanceCalculator<Metric>);
+    est += allocations_overhead + sizeof(TQFlatDetails::TQDistanceCalculator<Metric>);
     est += allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>);
-    est += allocations_overhead + sizeof(TQFlatDetails::TQSymmetricPreprocessor<Metric>);
-    est += params->dim * params->dim * sizeof(float);
+    est += allocations_overhead + sizeof(TQFlatDetails::TQPreprocessor<Metric>);
+    est += 2 * params->dim * params->dim * sizeof(float);
     est += params->projections * params->dim * sizeof(float);
-    est += (size_t{1} << TQFlatDetails::PolarBits(params->bits)) * 2 * sizeof(float);
+    const size_t levels = size_t{1} << mse_bits;
+    est += (2 * levels - 1) * sizeof(float);
     est += sizeof(DataBlocksContainer) + allocations_overhead;
     est += sizeof(tag_t) * RoundUpInitialCapacity(params->initialCapacity, params->blockSize);
     est += EstimateElementSize(params) *

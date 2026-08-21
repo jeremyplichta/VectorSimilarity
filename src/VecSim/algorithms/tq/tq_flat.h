@@ -9,545 +9,73 @@
 #pragma once
 
 #include "VecSim/algorithms/brute_force/brute_force_single.h"
+#include "VecSim/algorithms/tq/tq_model.h"
 #include "VecSim/spaces/computer/calculator.h"
 #include "VecSim/spaces/computer/preprocessor_container.h"
-#include "VecSim/spaces/computer/preprocessors.h"
-#include "VecSim/spaces/functions/TQ.h"
 #include "VecSim/utils/vec_utils.h"
 
 #include <algorithm>
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
+#include <cassert>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <random>
-#include <stdexcept>
 #include <vector>
 
 namespace TQFlatDetails {
 
-inline constexpr float kPi = 3.14159265358979323846f;
-inline constexpr uint64_t kQjlSeedOffset = 0xCAFEBABE00000001ULL;
-
-inline bool IsEven(size_t value) { return value != 0 && value % 2 == 0; }
-inline size_t PairCount(size_t dim) { return dim / 2; }
-
-inline size_t PolarBits(size_t total_bits) {
-    if (total_bits < 2 || total_bits > 16) {
-        throw std::invalid_argument("TQ-FLAT bits must be between 2 and 16");
+inline float NormalizeInPlace(float *values, size_t dim) {
+    const float norm_sq = SumSquaresScalar(values, dim);
+    if (norm_sq == 0.0f) {
+        return 0.0f;
     }
-    return total_bits - 1;
+    const float norm = std::sqrt(norm_sq);
+    const float inverse_norm = 1.0f / norm;
+    for (size_t i = 0; i < dim; ++i) {
+        values[i] *= inverse_norm;
+    }
+    return norm;
 }
-
-inline float QjlScale(size_t projections) {
-    if (projections == 0) {
-        throw std::invalid_argument("TQ-FLAT requires at least one projection");
-    }
-    return kPi / (2.0f * static_cast<float>(projections));
-}
-
-inline float DotProductFallback(const float *lhs, const float *rhs, size_t dim) {
-    float sum = 0.0f;
-    for (size_t idx = 0; idx < dim; ++idx) {
-        sum += lhs[idx] * rhs[idx];
-    }
-    return sum;
-}
-
-inline float SumSquaresFallback(const float *values, size_t dim) {
-    float sum = 0.0f;
-    for (size_t idx = 0; idx < dim; ++idx) {
-        sum += values[idx] * values[idx];
-    }
-    return sum;
-}
-
-inline int PackedResidualSignDotFallback(const uint8_t *lhs, const uint8_t *rhs,
-                                         size_t projections) {
-    const size_t full_bytes = projections / 8;
-    const size_t tail_bits = projections % 8;
-    int sign_dot = 0;
-
-    for (size_t idx = 0; idx < full_bytes; ++idx) {
-        const int diff_count = __builtin_popcount(static_cast<unsigned int>(lhs[idx] ^ rhs[idx]));
-        sign_dot += 8 - (2 * diff_count);
-    }
-
-    if (tail_bits != 0) {
-        const uint8_t valid_mask = static_cast<uint8_t>((uint16_t{1} << tail_bits) - 1u);
-        const uint8_t diff_bits =
-            static_cast<uint8_t>((lhs[full_bytes] ^ rhs[full_bytes]) & valid_mask);
-        const int diff_count = __builtin_popcount(static_cast<unsigned int>(diff_bits));
-        sign_dot += static_cast<int>(tail_bits) - (2 * diff_count);
-    }
-
-    return sign_dot;
-}
-
-struct QueryView {
-    const float *polar_lookup;
-    const float *rotated_query;
-    const float *qjl_byte_lut;
-    float query_norm_sq;
-};
-
-struct StorageView {
-    const float *radii;
-    float full_vector_norm_sq;
-    float code_norm_sq;
-    const void *angle_indices;
-    const uint8_t *residual_signs;
-};
-
-class TQModelState {
-public:
-    TQModelState(size_t dim, size_t total_bits, size_t projections, size_t seed, bool use_rotation)
-        : dim(dim), pairs(PairCount(dim)), total_bits(total_bits),
-          polar_bits(PolarBits(total_bits)), projections(projections), seed(seed),
-          use_rotation(use_rotation), levels(size_t{1} << polar_bits), angle_delta_mask(levels - 1),
-          packed_qjl_bytes((projections + 7) / 8), nibble_angle_codes(levels <= 16),
-          compact_angle_codes(levels <= 256), use_polar_lookup(levels <= 256),
-          qjl_scale(QjlScale(projections)), rotation_columns(dim * dim, 0.0f),
-          rotation_rows(dim * dim, 0.0f), qjl_projection_rows(projections * dim, 0.0f),
-          cos_lut(levels), sin_lut(levels), delta_cos_lut(levels), dot_product_func(nullptr),
-          sum_squares_func(nullptr), pair_sum_squares_func(nullptr), packed_sign_dot_func(nullptr),
-          symmetric_polar_func(nullptr) {
-        if (!IsEven(dim)) {
-            throw std::invalid_argument("TQ-FLAT requires even dimensions");
-        }
-
-        initializeRotation();
-        initializeQjlProjectionRows();
-        initializeTrigLut();
-        dot_product_func = spaces::Choose_FP32_InnerProduct_implementation_TQ(dim);
-        sum_squares_func = spaces::Choose_FP32_SumSquares_implementation_TQ(dim);
-        pair_sum_squares_func = spaces::Choose_FP32_SumSquares_implementation_TQ(pairs);
-        packed_sign_dot_func = spaces::Choose_TQ_PackedResidualSignDot_implementation(projections);
-        if (compactAngles()) {
-            symmetric_polar_func = spaces::Choose_TQ_SymmetricPolar_implementation(pairs);
-        }
-    }
-
-    size_t storageBlobSize() const {
-        return pairs * sizeof(float) + 2 * sizeof(float) + angleCodeBytes() + packedQjlBytes();
-    }
-
-    size_t queryBlobSize() const {
-        return (polarQueryWordCount() + packedQjlBytes() * 256 + 1) * sizeof(float);
-    }
-
-    StorageView storageView(const void *blob) const {
-        const auto *bytes = static_cast<const uint8_t *>(blob);
-        const auto *radii = reinterpret_cast<const float *>(bytes);
-        bytes += pairs * sizeof(float);
-        const auto *full_vector_norm_sq = reinterpret_cast<const float *>(bytes);
-        bytes += sizeof(float);
-        const auto *code_norm_sq = reinterpret_cast<const float *>(bytes);
-        bytes += sizeof(float);
-        const void *angles = bytes;
-        bytes += angleCodeBytes();
-        const auto *signs = reinterpret_cast<const uint8_t *>(bytes);
-        return {.radii = radii,
-                .full_vector_norm_sq = *full_vector_norm_sq,
-                .code_norm_sq = *code_norm_sq,
-                .angle_indices = angles,
-                .residual_signs = signs};
-    }
-
-    QueryView queryView(const void *blob) const {
-        const auto *bytes = static_cast<const float *>(blob);
-        const auto *polar_lookup = usePolarLut() ? bytes : nullptr;
-        const auto *rotated_query = usePolarLut() ? nullptr : bytes;
-        bytes += polarQueryWordCount();
-        const auto *qjl_byte_lut = bytes;
-        bytes += packedQjlBytes() * 256;
-        const float query_norm_sq = *bytes;
-        return {.polar_lookup = polar_lookup,
-                .rotated_query = rotated_query,
-                .qjl_byte_lut = qjl_byte_lut,
-                .query_norm_sq = query_norm_sq};
-    }
-
-    size_t packedQjlBytes() const { return packed_qjl_bytes; }
-    bool usePolarLut() const { return use_polar_lookup; }
-    bool compactAngles() const { return compact_angle_codes; }
-    size_t angleCodeBytes() const {
-        if (nibble_angle_codes) {
-            return (pairs + 1) / 2;
-        }
-        return pairs * (compactAngles() ? sizeof(uint8_t) : sizeof(uint16_t));
-    }
-    size_t polarQueryWordCount() const { return usePolarLut() ? pairs * levels : dim; }
-
-    void applyRotation(const float *input, float *output) const {
-        if (!use_rotation) {
-            std::memcpy(output, input, dim * sizeof(float));
-            return;
-        }
-        for (size_t row = 0; row < dim; ++row) {
-            output[row] = dotProduct(rotation_rows.data() + row * dim, input, dim);
-        }
-    }
-
-    void applyInverseRotation(const float *input, float *output) const {
-        if (!use_rotation) {
-            std::memcpy(output, input, dim * sizeof(float));
-            return;
-        }
-        for (size_t col = 0; col < dim; ++col) {
-            output[col] = dotProduct(rotation_columns.data() + col * dim, input, dim);
-        }
-    }
-
-    void encodePolar(const float *rotated, float *radii, uint16_t *angles) const {
-        for (size_t i = 0; i < pairs; ++i) {
-            const float a = rotated[2 * i];
-            const float b = rotated[2 * i + 1];
-            const float radius = std::sqrt(a * a + b * b);
-            const float theta = std::atan2(b, a);
-            const float normalized = (theta + kPi) / (2.0f * kPi);
-            const auto index = static_cast<uint16_t>(
-                static_cast<uint32_t>(std::floor(normalized * levels)) % levels);
-            radii[i] = radius;
-            angles[i] = index;
-        }
-    }
-
-    void reconstructRotated(const float *radii, const uint16_t *angles, float *rotated) const {
-        for (size_t i = 0; i < pairs; ++i) {
-            const uint16_t angle_index = angles[i];
-            const float radius = radii[i];
-            rotated[2 * i] = radius * cos_lut[angle_index];
-            rotated[2 * i + 1] = radius * sin_lut[angle_index];
-        }
-    }
-
-    void projectQjl(const float *input, float *output) const {
-        for (size_t row = 0; row < projections; ++row) {
-            const float *projection_row = qjl_projection_rows.data() + row * dim;
-            output[row] = dotProduct(projection_row, input, dim);
-        }
-    }
-
-    void sketchResidual(const float *residual, int8_t *signs) const {
-        std::vector<float> dots(projections);
-        projectQjl(residual, dots.data());
-        for (size_t i = 0; i < projections; ++i) {
-            signs[i] = dots[i] >= 0.0f ? int8_t{1} : int8_t{-1};
-        }
-    }
-
-    void packResidualSigns(const float *residual, uint8_t *packed_signs) const {
-        std::memset(packed_signs, 0, packedQjlBytes());
-        std::vector<float> dots(projections);
-        projectQjl(residual, dots.data());
-        for (size_t i = 0; i < projections; ++i) {
-            if (dots[i] >= 0.0f) {
-                packed_signs[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
-            }
-        }
-    }
-
-    void writeAngleCodes(const uint16_t *source_angles, void *destination) const {
-        if (nibble_angle_codes) {
-            auto *encoded = static_cast<uint8_t *>(destination);
-            std::memset(encoded, 0, angleCodeBytes());
-            for (size_t i = 0; i < pairs; ++i) {
-                const uint8_t angle = static_cast<uint8_t>(source_angles[i] & 0x0F);
-                const size_t byte_idx = i / 2;
-                if ((i % 2) == 0) {
-                    encoded[byte_idx] = angle;
-                } else {
-                    encoded[byte_idx] |= static_cast<uint8_t>(angle << 4);
-                }
-            }
-            return;
-        }
-        if (compactAngles()) {
-            auto *encoded = static_cast<uint8_t *>(destination);
-            for (size_t i = 0; i < pairs; ++i) {
-                encoded[i] = static_cast<uint8_t>(source_angles[i]);
-            }
-            return;
-        }
-        std::memcpy(destination, source_angles, pairs * sizeof(uint16_t));
-    }
-
-    uint16_t angleCodeAt(const StorageView &storage, size_t idx) const {
-        if (nibble_angle_codes) {
-            const auto *encoded = static_cast<const uint8_t *>(storage.angle_indices);
-            const uint8_t packed = encoded[idx / 2];
-            return (idx % 2 == 0) ? static_cast<uint16_t>(packed & 0x0F)
-                                  : static_cast<uint16_t>((packed >> 4) & 0x0F);
-        }
-        if (compactAngles()) {
-            return static_cast<const uint8_t *>(storage.angle_indices)[idx];
-        }
-        return static_cast<const uint16_t *>(storage.angle_indices)[idx];
-    }
-
-    void buildPolarLookup(const float *rotated_query, float *polar_lookup) const {
-        for (size_t pair_idx = 0; pair_idx < pairs; ++pair_idx) {
-            const float q_a = rotated_query[2 * pair_idx];
-            const float q_b = rotated_query[2 * pair_idx + 1];
-            float *pair_lookup = polar_lookup + pair_idx * levels;
-#if defined(__ARM_NEON)
-            const float32x4_t q_a_vec = vdupq_n_f32(q_a);
-            const float32x4_t q_b_vec = vdupq_n_f32(q_b);
-            size_t angle_idx = 0;
-            for (; angle_idx + 4 <= levels; angle_idx += 4) {
-                const float32x4_t cos_vec = vld1q_f32(cos_lut.data() + angle_idx);
-                const float32x4_t sin_vec = vld1q_f32(sin_lut.data() + angle_idx);
-                const float32x4_t estimate =
-                    vmlaq_f32(vmulq_f32(q_a_vec, cos_vec), q_b_vec, sin_vec);
-                vst1q_f32(pair_lookup + angle_idx, estimate);
-            }
-            for (; angle_idx < levels; ++angle_idx) {
-                pair_lookup[angle_idx] = q_a * cos_lut[angle_idx] + q_b * sin_lut[angle_idx];
-            }
-#else
-            for (size_t angle_idx = 0; angle_idx < levels; ++angle_idx) {
-                pair_lookup[angle_idx] = q_a * cos_lut[angle_idx] + q_b * sin_lut[angle_idx];
-            }
-#endif
-        }
-    }
-
-    void buildQjlByteLookup(const float *qjl_query_dots, float *qjl_byte_lut) const {
-        for (size_t byte_idx = 0; byte_idx < packedQjlBytes(); ++byte_idx) {
-            const size_t base_projection = byte_idx * 8;
-            const size_t valid_bits = std::min<size_t>(8, projections - base_projection);
-            float *byte_lookup = qjl_byte_lut + byte_idx * 256;
-            for (size_t pattern = 0; pattern < 256; ++pattern) {
-                float sum = 0.0f;
-                for (size_t bit_idx = 0; bit_idx < valid_bits; ++bit_idx) {
-                    const bool positive = (pattern & (size_t{1} << bit_idx)) != 0;
-                    const float sign = positive ? 1.0f : -1.0f;
-                    sum += sign * qjl_query_dots[base_projection + bit_idx];
-                }
-                byte_lookup[pattern] = sum;
-            }
-        }
-    }
-
-    float dotProduct(const float *lhs, const float *rhs, size_t dimension) const {
-        if (dot_product_func) {
-            return dot_product_func(lhs, rhs, dimension);
-        }
-        return DotProductFallback(lhs, rhs, dimension);
-    }
-
-    float sumSquares(const float *values, size_t dimension) const {
-        if (dimension == dim && sum_squares_func) {
-            return sum_squares_func(values, dimension);
-        }
-        if (dimension == pairs && pair_sum_squares_func) {
-            return pair_sum_squares_func(values, dimension);
-        }
-        return SumSquaresFallback(values, dimension);
-    }
-
-    int packedResidualSignDot(const uint8_t *lhs, const uint8_t *rhs) const {
-        if (packed_sign_dot_func) {
-            return packed_sign_dot_func(lhs, rhs, projections);
-        }
-        return PackedResidualSignDotFallback(lhs, rhs, projections);
-    }
-
-    void unpackNibbleAngles(const void *encoded_angles, uint8_t *decoded_angles) const {
-        const auto *encoded = static_cast<const uint8_t *>(encoded_angles);
-        for (size_t idx = 0; idx < pairs; ++idx) {
-            const uint8_t packed = encoded[idx / 2];
-            decoded_angles[idx] = (idx % 2 == 0) ? static_cast<uint8_t>(packed & 0x0F)
-                                                 : static_cast<uint8_t>((packed >> 4) & 0x0F);
-        }
-    }
-
-    float estimateInnerProduct(const StorageView &storage, const QueryView &query) const {
-        float polar_estimate = 0.0f;
-        if (usePolarLut()) {
-            for (size_t i = 0; i < pairs; ++i) {
-                const uint16_t angle_index = angleCodeAt(storage, i);
-                polar_estimate += storage.radii[i] * query.polar_lookup[i * levels + angle_index];
-            }
-        } else {
-            for (size_t i = 0; i < pairs; ++i) {
-                const uint16_t angle_index = angleCodeAt(storage, i);
-                const float q_a = query.rotated_query[2 * i];
-                const float q_b = query.rotated_query[2 * i + 1];
-                polar_estimate +=
-                    storage.radii[i] * (q_a * cos_lut[angle_index] + q_b * sin_lut[angle_index]);
-            }
-        }
-
-        float qjl_estimate = 0.0f;
-        for (size_t i = 0; i < packedQjlBytes(); ++i) {
-            qjl_estimate += query.qjl_byte_lut[i * 256 + storage.residual_signs[i]];
-        }
-
-        return polar_estimate + qjl_scale * qjl_estimate;
-    }
-
-    float estimateInnerProductSymmetric(const StorageView &lhs, const StorageView &rhs) const {
-        float polar_estimate = 0.0f;
-        if (symmetric_polar_func && compactAngles()) {
-            std::vector<uint8_t> lhs_unpacked;
-            std::vector<uint8_t> rhs_unpacked;
-            const uint8_t *lhs_angles = static_cast<const uint8_t *>(lhs.angle_indices);
-            const uint8_t *rhs_angles = static_cast<const uint8_t *>(rhs.angle_indices);
-
-            if (nibble_angle_codes) {
-                lhs_unpacked.resize(pairs);
-                rhs_unpacked.resize(pairs);
-                unpackNibbleAngles(lhs.angle_indices, lhs_unpacked.data());
-                unpackNibbleAngles(rhs.angle_indices, rhs_unpacked.data());
-                lhs_angles = lhs_unpacked.data();
-                rhs_angles = rhs_unpacked.data();
-            }
-
-            polar_estimate = symmetric_polar_func(lhs.radii, lhs_angles, rhs.radii, rhs_angles,
-                                                  delta_cos_lut.data(),
-                                                  static_cast<uint8_t>(angle_delta_mask), pairs);
-        } else {
-            for (size_t i = 0; i < pairs; ++i) {
-                const uint16_t lhs_angle = angleCodeAt(lhs, i);
-                const uint16_t rhs_angle = angleCodeAt(rhs, i);
-                const size_t delta =
-                    (static_cast<size_t>(lhs_angle) - static_cast<size_t>(rhs_angle)) &
-                    angle_delta_mask;
-                polar_estimate += lhs.radii[i] * rhs.radii[i] * delta_cos_lut[delta];
-            }
-        }
-
-        const int sign_dot = packedResidualSignDot(lhs.residual_signs, rhs.residual_signs);
-
-        return polar_estimate + qjl_scale * static_cast<float>(sign_dot);
-    }
-
-    size_t dim;
-    size_t pairs;
-    size_t total_bits;
-    size_t polar_bits;
-    size_t projections;
-    size_t seed;
-    bool use_rotation;
-    size_t levels;
-    size_t angle_delta_mask;
-    size_t packed_qjl_bytes;
-    bool nibble_angle_codes;
-    bool compact_angle_codes;
-    bool use_polar_lookup;
-    float qjl_scale;
-
-private:
-    void initializeRotation() {
-        if (!use_rotation) {
-            return;
-        }
-
-        std::mt19937_64 rng(seed);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
-
-        std::vector<float> candidate(dim);
-        for (size_t col = 0; col < dim; ++col) {
-            bool accepted = false;
-            for (size_t attempt = 0; attempt < 16 && !accepted; ++attempt) {
-                for (size_t row = 0; row < dim; ++row) {
-                    candidate[row] = normal(rng);
-                }
-
-                for (size_t prev = 0; prev < col; ++prev) {
-                    const float *prev_col = rotation_columns.data() + prev * dim;
-                    float dot = 0.0f;
-                    for (size_t row = 0; row < dim; ++row) {
-                        dot += candidate[row] * prev_col[row];
-                    }
-                    for (size_t row = 0; row < dim; ++row) {
-                        candidate[row] -= dot * prev_col[row];
-                    }
-                }
-
-                float norm_sq = 0.0f;
-                for (float value : candidate) {
-                    norm_sq += value * value;
-                }
-
-                if (norm_sq > 1e-12f) {
-                    float inv_norm = 1.0f / std::sqrt(norm_sq);
-                    if (candidate[col] < 0.0f) {
-                        inv_norm = -inv_norm;
-                    }
-                    float *dst_col = rotation_columns.data() + col * dim;
-                    for (size_t row = 0; row < dim; ++row) {
-                        dst_col[row] = candidate[row] * inv_norm;
-                    }
-                    accepted = true;
-                }
-            }
-
-            if (!accepted) {
-                throw std::runtime_error("Failed to construct TQ rotation");
-            }
-        }
-        for (size_t row = 0; row < dim; ++row) {
-            float *dst_row = rotation_rows.data() + row * dim;
-            for (size_t col = 0; col < dim; ++col) {
-                dst_row[col] = rotation_columns[col * dim + row];
-            }
-        }
-    }
-
-    void initializeQjlProjectionRows() {
-        std::mt19937_64 rng(seed + kQjlSeedOffset);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
-        for (float &value : qjl_projection_rows) {
-            value = normal(rng);
-        }
-    }
-
-    void initializeTrigLut() {
-        for (size_t i = 0; i < levels; ++i) {
-            const float theta =
-                (static_cast<float>(i) / static_cast<float>(levels)) * (2.0f * kPi) - kPi;
-            cos_lut[i] = std::cos(theta);
-            sin_lut[i] = std::sin(theta);
-            delta_cos_lut[i] =
-                std::cos((static_cast<float>(i) / static_cast<float>(levels)) * (2.0f * kPi));
-        }
-    }
-
-    std::vector<float> rotation_columns;
-    std::vector<float> rotation_rows;
-    std::vector<float> qjl_projection_rows;
-    std::vector<float> cos_lut;
-    std::vector<float> sin_lut;
-    std::vector<float> delta_cos_lut;
-    spaces::tq_inner_product_func_t dot_product_func;
-    spaces::tq_sum_squares_func_t sum_squares_func;
-    spaces::tq_sum_squares_func_t pair_sum_squares_func;
-    spaces::tq_packed_residual_sign_dot_func_t packed_sign_dot_func;
-    spaces::tq_symmetric_polar_func_t symmetric_polar_func;
-};
 
 template <VecSimMetric Metric>
 class TQDistanceCalculator : public IndexCalculatorInterface<float> {
 private:
-    static float calcWithContext(const void *opaque_state, const void *storage_blob,
-                                 const void *query_blob, size_t dim) {
-        UNUSED(dim);
+    static float calcStoredWithContext(const void *opaque_state, const void *lhs_blob,
+                                       const void *rhs_blob, size_t dim) {
         const auto *state = static_cast<const TQModelState *>(opaque_state);
+        assert(dim == state->dim);
+        std::vector<float> lhs(dim);
+        std::vector<float> rhs(dim);
+        state->decode(state->storageView(lhs_blob), lhs.data());
+        state->decode(state->storageView(rhs_blob), rhs.data());
+
+        if constexpr (Metric == VecSimMetric_Cosine) {
+            NormalizeInPlace(lhs.data(), dim);
+            NormalizeInPlace(rhs.data(), dim);
+        }
+        if constexpr (Metric == VecSimMetric_L2) {
+            float distance = 0.0f;
+            for (size_t i = 0; i < dim; ++i) {
+                const float difference = lhs[i] - rhs[i];
+                distance += difference * difference;
+            }
+            return distance;
+        }
+        return 1.0f - DotProductScalar(lhs.data(), rhs.data(), dim);
+    }
+
+    static float calcQueryWithContext(const void *opaque_state, const void *storage_blob,
+                                      const void *query_blob, size_t dim) {
+        const auto *state = static_cast<const TQModelState *>(opaque_state);
+        assert(dim == state->dim);
         const auto storage = state->storageView(storage_blob);
         const auto query = state->queryView(query_blob);
         const float estimate = state->estimateInnerProduct(storage, query);
-
         if constexpr (Metric == VecSimMetric_L2) {
-            return std::max(query.query_norm_sq + storage.full_vector_norm_sq - 2.0f * estimate,
-                            0.0f);
+            const float storage_norm_sq = storage.source_scale * storage.source_scale;
+            return std::max(query.norm_sq + storage_norm_sq - 2.0f * estimate, 0.0f);
         }
-
         return 1.0f - estimate;
     }
 
@@ -557,62 +85,18 @@ public:
         : IndexCalculatorInterface<float>(allocator), state(std::move(state)) {}
 
     float calcDistance(const void *v1, const void *v2, size_t dim) const override {
-        return calcWithContext(state.get(), v1, v2, dim);
+        return calcStoredWithContext(state.get(), v1, v2, dim);
     }
 
     float calcDistanceForQuery(const void *candidate_vector, const void *query_vector,
                                size_t dim) const override {
-        return calcWithContext(state.get(), candidate_vector, query_vector, dim);
+        return calcQueryWithContext(state.get(), candidate_vector, query_vector, dim);
     }
 
     DistanceDispatch<float> getDistanceDispatch(DistanceMode mode) const override {
-        // BruteForceIndex currently routes preprocessed queries through calcDistance(), so its
-        // stored dispatch is intentionally asymmetric as well. TQ-HNSW supplies a separate
-        // symmetric calculator for graph construction.
-        UNUSED(mode);
-        return DistanceDispatch<float>::stateful(state.get(), calcWithContext);
-    }
-
-private:
-    std::shared_ptr<TQModelState> state;
-};
-
-template <VecSimMetric Metric>
-class TQSymmetricDistanceCalculator : public IndexCalculatorInterface<float> {
-private:
-    static float calcWithContext(const void *opaque_state, const void *lhs_blob,
-                                 const void *rhs_blob, size_t dim) {
-        UNUSED(dim);
-        const auto *state = static_cast<const TQModelState *>(opaque_state);
-        const auto lhs = state->storageView(lhs_blob);
-        const auto rhs = state->storageView(rhs_blob);
-        const float estimate = state->estimateInnerProductSymmetric(lhs, rhs);
-
-        if constexpr (Metric == VecSimMetric_L2) {
-            return std::max(lhs.full_vector_norm_sq + rhs.full_vector_norm_sq - 2.0f * estimate,
-                            0.0f);
-        }
-
-        return 1.0f - estimate;
-    }
-
-public:
-    TQSymmetricDistanceCalculator(std::shared_ptr<VecSimAllocator> allocator,
-                                  std::shared_ptr<TQModelState> state)
-        : IndexCalculatorInterface<float>(allocator), state(std::move(state)) {}
-
-    float calcDistance(const void *v1, const void *v2, size_t dim) const override {
-        return calcWithContext(state.get(), v1, v2, dim);
-    }
-
-    float calcDistanceForQuery(const void *candidate_vector, const void *query_vector,
-                               size_t dim) const override {
-        return calcWithContext(state.get(), candidate_vector, query_vector, dim);
-    }
-
-    DistanceDispatch<float> getDistanceDispatch(DistanceMode mode) const override {
-        UNUSED(mode);
-        return DistanceDispatch<float>::stateful(state.get(), calcWithContext);
+        return mode == DistanceMode::StoredToStored
+                   ? DistanceDispatch<float>::stateful(state.get(), calcStoredWithContext)
+                   : DistanceDispatch<float>::stateful(state.get(), calcQueryWithContext);
     }
 
 private:
@@ -623,8 +107,7 @@ template <VecSimMetric Metric>
 class TQPreprocessor : public PreprocessorInterface {
 public:
     TQPreprocessor(std::shared_ptr<VecSimAllocator> allocator, std::shared_ptr<TQModelState> state)
-        : PreprocessorInterface(allocator), normalize_func(spaces::GetNormalizeFunc<float>()),
-          state(std::move(state)), working_dim(this->state->dim) {}
+        : PreprocessorInterface(allocator), state(std::move(state)) {}
 
     void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
                     size_t &storage_blob_size, size_t &query_blob_size,
@@ -640,42 +123,41 @@ public:
             storage_blob =
                 this->allocator->allocate_aligned(state->storageBlobSize(), storage_alignment);
         }
+        std::memset(storage_blob, 0, state->storageBlobSize());
 
-        const auto *typed_blob = static_cast<const float *>(original_blob);
-        std::vector<float> normalized(typed_blob, typed_blob + working_dim);
-        normalizeIfNeeded(normalized.data());
-
-        std::vector<float> rotated(working_dim);
-        std::vector<uint16_t> angles(state->pairs);
-        std::vector<float> reconstructed_rotated(working_dim);
-        std::vector<float> reconstructed(working_dim);
-        std::vector<float> residual(working_dim);
-
-        state->applyRotation(normalized.data(), rotated.data());
-
-        auto *bytes = static_cast<uint8_t *>(storage_blob);
-        auto *radii = reinterpret_cast<float *>(bytes);
-        bytes += state->pairs * sizeof(float);
-        auto *full_vector_norm_sq = reinterpret_cast<float *>(bytes);
-        bytes += sizeof(float);
-        auto *code_norm_sq = reinterpret_cast<float *>(bytes);
-        bytes += sizeof(float);
-        void *encoded_angles = bytes;
-        bytes += state->angleCodeBytes();
-        auto *signs = reinterpret_cast<uint8_t *>(bytes);
-
-        state->encodePolar(rotated.data(), radii, angles.data());
-        state->writeAngleCodes(angles.data(), encoded_angles);
-        *full_vector_norm_sq = state->sumSquares(normalized.data(), working_dim);
-        *code_norm_sq = state->sumSquares(radii, state->pairs);
-
-        state->reconstructRotated(radii, angles.data(), reconstructed_rotated.data());
-        state->applyInverseRotation(reconstructed_rotated.data(), reconstructed.data());
-        for (size_t i = 0; i < working_dim; ++i) {
-            residual[i] = normalized[i] - reconstructed[i];
+        const auto *input = static_cast<const float *>(original_blob);
+        std::vector<float> unit(input, input + state->dim);
+        const float original_norm = NormalizeInPlace(unit.data(), state->dim);
+        if (original_norm == 0.0f) {
+            state->writeMetadata(storage_blob, 0.0f, 0.0f);
+            input_blob_size = state->storageBlobSize();
+            return;
         }
-        state->packResidualSigns(residual.data(), signs);
 
+        auto *indices = static_cast<uint8_t *>(storage_blob);
+        auto *signs = indices + state->packedIndexBytes();
+        std::vector<float> reconstructed(state->dim);
+        std::vector<float> residual(state->dim);
+        state->encodeMse(unit.data(), indices, reconstructed.data());
+        for (size_t i = 0; i < state->dim; ++i) {
+            residual[i] = unit[i] - reconstructed[i];
+        }
+
+        const float residual_norm = std::sqrt(SumSquaresScalar(residual.data(), state->dim));
+        if (residual_norm > 0.0f) {
+            const float inverse_residual_norm = 1.0f / residual_norm;
+            for (float &value : residual) {
+                value *= inverse_residual_norm;
+            }
+            state->packResidualSigns(residual.data(), signs);
+        } else {
+            // sign(0) is +1. The signs are ignored because gamma is zero, but keeping the
+            // canonical mathematical value makes byte-level tests unambiguous.
+            std::memset(signs, 0xFF, state->packedQjlBytes());
+        }
+
+        const float source_scale = Metric == VecSimMetric_Cosine ? 1.0f : original_norm;
+        state->writeMetadata(storage_blob, source_scale, residual_norm);
         input_blob_size = state->storageBlobSize();
     }
 
@@ -685,96 +167,47 @@ public:
             query_blob = this->allocator->allocate_aligned(state->queryBlobSize(), alignment);
         }
 
-        const auto *typed_blob = static_cast<const float *>(original_blob);
-        std::vector<float> normalized(typed_blob, typed_blob + working_dim);
-        normalizeIfNeeded(normalized.data());
-
-        auto *query_words = static_cast<float *>(query_blob);
-        auto *polar_query_data = query_words;
-        query_words += state->polarQueryWordCount();
-        auto *qjl_byte_lut = query_words;
-        auto *query_norm_sq = qjl_byte_lut + state->packedQjlBytes() * 256;
-
-        std::vector<float> rotated_query(working_dim);
-        std::vector<float> qjl_query_dots(state->projections);
-
-        state->applyRotation(normalized.data(), rotated_query.data());
-        if (state->usePolarLut()) {
-            state->buildPolarLookup(rotated_query.data(), polar_query_data);
-        } else {
-            std::memcpy(polar_query_data, rotated_query.data(), working_dim * sizeof(float));
+        const auto *input = static_cast<const float *>(original_blob);
+        std::vector<float> query(input, input + state->dim);
+        if constexpr (Metric == VecSimMetric_Cosine) {
+            NormalizeInPlace(query.data(), state->dim);
         }
-        state->projectQjl(normalized.data(), qjl_query_dots.data());
-        state->buildQjlByteLookup(qjl_query_dots.data(), qjl_byte_lut);
-        *query_norm_sq = state->sumSquares(normalized.data(), working_dim);
 
+        auto *words = static_cast<float *>(query_blob);
+        auto *rotated = words;
+        auto *projected = rotated + state->dim;
+        auto *norm_sq = projected + state->projections;
+        state->applyRotation(query.data(), rotated);
+        state->projectQjl(query.data(), projected);
+        *norm_sq = SumSquaresScalar(query.data(), state->dim);
         input_blob_size = state->queryBlobSize();
     }
 
     void preprocessStorageInPlace(void *original_blob, size_t input_blob_size) const override {
         assert(original_blob);
         assert(input_blob_size >= state->storageBlobSize());
-        const size_t encoded_words = (state->storageBlobSize() + sizeof(float) - 1) / sizeof(float);
-        std::vector<float> encoded(encoded_words);
+        std::vector<uint8_t> encoded(state->storageBlobSize());
         void *encoded_blob = encoded.data();
-        size_t storage_blob_size = input_blob_size;
-        // encoded_blob is non-null, so no aligned allocation happens; alignment is unused.
-        preprocessForStorage(original_blob, encoded_blob, storage_blob_size, 0);
+        size_t encoded_size = input_blob_size;
+        preprocessForStorage(original_blob, encoded_blob, encoded_size, 0);
         std::memcpy(original_blob, encoded.data(), state->storageBlobSize());
     }
 
 private:
-    void normalizeIfNeeded(float *values) const {
-        if constexpr (Metric == VecSimMetric_Cosine) {
-            normalize_func(values, working_dim);
-        }
-    }
-
-    spaces::normalizeVector_f<float> normalize_func;
     std::shared_ptr<TQModelState> state;
-    size_t working_dim;
-};
-
-template <VecSimMetric Metric>
-class TQSymmetricPreprocessor : public PreprocessorInterface {
-public:
-    TQSymmetricPreprocessor(std::shared_ptr<VecSimAllocator> allocator,
-                            std::shared_ptr<TQModelState> state)
-        : PreprocessorInterface(allocator), delegate(allocator, std::move(state)) {}
-
-    void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
-                    size_t &storage_blob_size, size_t &query_blob_size,
-                    unsigned char storage_alignment, unsigned char query_alignment) const override {
-        delegate.preprocessForStorage(original_blob, storage_blob, storage_blob_size,
-                                      storage_alignment);
-        delegate.preprocessForStorage(original_blob, query_blob, query_blob_size, query_alignment);
-    }
-
-    void preprocessForStorage(const void *original_blob, void *&storage_blob,
-                              size_t &input_blob_size,
-                              unsigned char storage_alignment) const override {
-        delegate.preprocessForStorage(original_blob, storage_blob, input_blob_size,
-                                      storage_alignment);
-    }
-
-    void preprocessQuery(const void *original_blob, void *&query_blob, size_t &input_blob_size,
-                         unsigned char query_alignment) const override {
-        delegate.preprocessForStorage(original_blob, query_blob, input_blob_size, query_alignment);
-    }
-
-    void preprocessStorageInPlace(void *original_blob, size_t input_blob_size) const override {
-        delegate.preprocessStorageInPlace(original_blob, input_blob_size);
-    }
-
-private:
-    TQPreprocessor<Metric> delegate;
 };
 
 template <VecSimMetric Metric>
 inline size_t GetStorageDataSize(const TQFlatParams *params) {
-    return TQModelState(params->dim, params->bits, params->projections, params->seed,
-                        params->useRotation)
-        .storageBlobSize();
+    MseBits(params->bits);
+    if (params->dim < 2) {
+        throw std::invalid_argument("TurboQuant requires dimension >= 2");
+    }
+    if (params->projections != params->dim) {
+        throw std::invalid_argument("Paper-faithful TurboQuant requires projections == dim");
+    }
+    return PackedBytes(params->dim, params->bits - 1) + PackedBytes(params->dim, 1) +
+           2 * sizeof(float);
 }
 
 template <VecSimMetric Metric>
@@ -786,7 +219,7 @@ inline IndexComponents<float, float> CreateTQComponents(std::shared_ptr<VecSimAl
     auto *preprocessors =
         new (allocator) MultiPreprocessorsContainer<float, 1>(allocator, alignof(float));
     auto *tq_preprocessor = new (allocator) TQPreprocessor<Metric>(allocator, state);
-    int rc = preprocessors->addPreprocessor(tq_preprocessor);
+    const int rc = preprocessors->addPreprocessor(tq_preprocessor);
     UNUSED(rc);
     assert(rc != -1 && "TQ preprocessor was not added correctly");
     return {index_calculator, preprocessors};
@@ -795,17 +228,7 @@ inline IndexComponents<float, float> CreateTQComponents(std::shared_ptr<VecSimAl
 template <VecSimMetric Metric>
 inline IndexComponents<float, float>
 CreateTQHNSWComponents(std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params) {
-    auto state = std::make_shared<TQModelState>(params->dim, params->bits, params->projections,
-                                                params->seed, params->useRotation);
-    auto *index_calculator =
-        new (allocator) TQSymmetricDistanceCalculator<Metric>(allocator, state);
-    auto *preprocessors =
-        new (allocator) MultiPreprocessorsContainer<float, 1>(allocator, alignof(float));
-    auto *tq_preprocessor = new (allocator) TQSymmetricPreprocessor<Metric>(allocator, state);
-    int rc = preprocessors->addPreprocessor(tq_preprocessor);
-    UNUSED(rc);
-    assert(rc != -1 && "TQ symmetric preprocessor was not added correctly");
-    return {index_calculator, preprocessors};
+    return CreateTQComponents<Metric>(std::move(allocator), params);
 }
 
 class TQFlatIndex : public BruteForceIndex_Single<float, float> {
@@ -815,26 +238,24 @@ public:
         : BruteForceIndex_Single<float, float>(params, abstract_init_params, components) {}
 
     int addVector(const void *vector_data, labelType label) override {
-        auto existing_id = this->labelToIdLookup.find(label);
+        const auto existing_id = this->labelToIdLookup.find(label);
         if (existing_id != this->labelToIdLookup.end()) {
-            auto processed_blob = this->preprocessForStorage(vector_data);
+            const auto processed_blob = this->preprocessForStorage(vector_data);
             this->vectors->updateElement(existing_id->second, processed_blob.get());
             return 0;
         }
-
         this->appendVector(vector_data, label);
         return 1;
     }
 
     double getDistanceFrom_Unsafe(labelType label, const void *vector_data) const override {
-        auto optional_id = this->labelToIdLookup.find(label);
+        const auto optional_id = this->labelToIdLookup.find(label);
         if (optional_id == this->labelToIdLookup.end()) {
             return INVALID_SCORE;
         }
-
-        auto processed_query = this->preprocessQuery(vector_data);
-        return this->calcDistance(this->getDataByInternalId(optional_id->second),
-                                  processed_query.get());
+        const auto processed_query = this->preprocessQuery(vector_data);
+        return this->calcDistanceForQuery(this->getDataByInternalId(optional_id->second),
+                                          processed_query.get());
     }
 
     VecSimIndexDebugInfo debugInfo() const override {

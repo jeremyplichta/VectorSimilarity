@@ -47,8 +47,10 @@ VecSimIndex *NewIndexImpl(const VecSimParams *params) {
 
 template <VecSimMetric Metric>
 size_t EstimateInitialSizeImpl(const TQFlatParams *params) {
-    const size_t polar_bits = TQFlatDetails::PolarBits(params->bits);
-    TQFlatDetails::QjlScale(params->projections);
+    const size_t mse_bits = TQFlatDetails::MseBits(params->bits);
+    if (params->projections != params->dim) {
+        throw std::invalid_argument("Paper-faithful TurboQuant requires projections == dim");
+    }
     size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
     size_t est = sizeof(VecSimAllocator) + allocations_overhead;
     est += sizeof(TQFlatDetails::TQFlatIndex);
@@ -56,9 +58,10 @@ size_t EstimateInitialSizeImpl(const TQFlatParams *params) {
     est += allocations_overhead + sizeof(TQFlatDetails::TQDistanceCalculator<Metric>);
     est += allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>);
     est += allocations_overhead + sizeof(TQFlatDetails::TQPreprocessor<Metric>);
-    est += params->dim * params->dim * sizeof(float);
+    est += 2 * params->dim * params->dim * sizeof(float);
     est += params->projections * params->dim * sizeof(float);
-    est += (size_t{1} << polar_bits) * 2 * sizeof(float);
+    const size_t levels = size_t{1} << mse_bits;
+    est += (2 * levels - 1) * sizeof(float);
     return est;
 }
 

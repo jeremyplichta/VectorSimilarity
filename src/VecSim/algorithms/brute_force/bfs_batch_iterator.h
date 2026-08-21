@@ -32,7 +32,7 @@ private:
             if (VECSIM_TIMEOUT(this->getTimeoutCtx())) {
                 return VecSim_QueryReply_TimedOut;
             }
-            auto score = this->index->calcDistance(vector, this->getQueryBlob());
+            auto score = this->index->calcDistanceForQuery(vector, this->getQueryBlob());
             this->scores.emplace_back(score, this->index->getVectorLabel(curr_id));
             ++curr_id;
         }
