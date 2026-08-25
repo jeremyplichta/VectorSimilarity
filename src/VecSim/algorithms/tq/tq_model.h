@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include "VecSim/algorithms/tq/tq_fast_structured_rotation.h"
 #include "VecSim/memory/vecsim_malloc.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <new>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__aarch64__)
@@ -152,6 +154,23 @@ struct TQCodecConfig {
                 .qjl_seed = seed + kQjlSeedOffset,
                 .use_rotation = use_rotation};
     }
+
+    static TQCodecConfig FastStructuredRotation(size_t dimension, size_t total_bits,
+                                                size_t projections, uint64_t seed) {
+        return {.dimension = dimension,
+                .total_bits = total_bits,
+                .mse_bits = MseBits(total_bits),
+                .projections = projections,
+                .metric_contract = TQMetricContract::CosineOrInnerProductV1,
+                .codec_version = TQCodecVersion::PaperEstimatorV1,
+                .payload_layout_version = TQPayloadLayoutVersion::PaperV1,
+                .model_transform_version = TQModelTransformVersion::FastStructuredRotationV1,
+                .rotation_backend_version = TQRotationBackendVersion::FastStructuredV1,
+                .qjl_backend_version = TQQjlBackendVersion::DenseGaussianV1,
+                .rotation_seed = seed,
+                .qjl_seed = seed + kQjlSeedOffset,
+                .use_rotation = true};
+    }
 };
 
 struct TQModelIdentity {
@@ -217,7 +236,13 @@ inline void ValidateTQCodecConfig(const TQCodecConfig &config) {
         }
         break;
     case TQModelTransformVersion::FastStructuredRotationV1:
-        throw std::invalid_argument("FastStructuredRotationV1 is not implemented yet");
+        if (config.rotation_backend_version != TQRotationBackendVersion::FastStructuredV1 ||
+            config.qjl_backend_version != TQQjlBackendVersion::DenseGaussianV1 ||
+            !config.use_rotation) {
+            throw std::invalid_argument(
+                "FastStructuredRotationV1 requires fast rotation and dense QJL");
+        }
+        break;
     case TQModelTransformVersion::FastStructuredV1:
         throw std::invalid_argument("FastStructuredV1 is not implemented yet");
     default:
@@ -227,7 +252,7 @@ inline void ValidateTQCodecConfig(const TQCodecConfig &config) {
     case TQRotationBackendVersion::DenseHaarV1:
         break;
     case TQRotationBackendVersion::FastStructuredV1:
-        throw std::invalid_argument("Fast structured TurboQuant rotation is not implemented yet");
+        break;
     default:
         throw std::invalid_argument("Unsupported TurboQuant rotation backend version");
     }
@@ -240,7 +265,15 @@ inline void ValidateTQCodecConfig(const TQCodecConfig &config) {
         throw std::invalid_argument("Unsupported TurboQuant QJL backend version");
     }
 
-    CheckedMultiply(config.dimension, config.dimension, "TurboQuant dense rotation size overflow");
+    if (config.rotation_backend_version == TQRotationBackendVersion::DenseHaarV1) {
+        CheckedMultiply(config.dimension, config.dimension,
+                        "TurboQuant dense rotation size overflow");
+    } else {
+        CheckedBytes(config.dimension, sizeof(int8_t),
+                     "TurboQuant structured rotation sign size overflow");
+        CheckedBytes(config.dimension, sizeof(size_t),
+                     "TurboQuant structured rotation permutation size overflow");
+    }
     CheckedMultiply(config.projections, config.dimension, "TurboQuant dense QJL size overflow");
     PackedBytes(config.dimension, config.mse_bits);
     PackedBytes(config.projections, 1);
@@ -554,33 +587,36 @@ class TQRotationBackend {
 public:
     TQRotationBackend(const std::shared_ptr<VecSimAllocator> &allocator,
                       const TQCodecConfig &config)
-        : version(config.rotation_backend_version), dense_haar(allocator, config) {}
+        : backend(createBackend(allocator, config)) {}
 
     void forwardRotate(const float *input, float *output, float *scratch) const {
-        switch (version) {
+        std::visit([input, output, scratch](
+                       const auto &selected) { selected.forwardRotate(input, output, scratch); },
+                   backend);
+    }
+
+    void inverseRotate(const float *input, float *output, float *scratch) const {
+        std::visit([input, output, scratch](
+                       const auto &selected) { selected.inverseRotate(input, output, scratch); },
+                   backend);
+    }
+
+private:
+    using BackendState = std::variant<DenseHaarRotationV1State, FastStructuredRotationV1>;
+
+    static BackendState createBackend(const std::shared_ptr<VecSimAllocator> &allocator,
+                                      const TQCodecConfig &config) {
+        switch (config.rotation_backend_version) {
         case TQRotationBackendVersion::DenseHaarV1:
-            dense_haar.forwardRotate(input, output, scratch);
-            return;
+            return BackendState(std::in_place_type<DenseHaarRotationV1State>, allocator, config);
         case TQRotationBackendVersion::FastStructuredV1:
-            break;
+            return BackendState(std::in_place_type<FastStructuredRotationV1>, allocator,
+                                config.dimension, config.rotation_seed);
         }
         throw std::logic_error("Unsupported TurboQuant rotation backend");
     }
 
-    void inverseRotate(const float *input, float *output, float *scratch) const {
-        switch (version) {
-        case TQRotationBackendVersion::DenseHaarV1:
-            dense_haar.inverseRotate(input, output, scratch);
-            return;
-        case TQRotationBackendVersion::FastStructuredV1:
-            break;
-        }
-        throw std::logic_error("Unsupported TurboQuant inverse-rotation backend");
-    }
-
-private:
-    TQRotationBackendVersion version;
-    DenseHaarRotationV1State dense_haar;
+    BackendState backend;
 };
 
 class TQQjlBackend {
@@ -986,6 +1022,14 @@ AllocateDenseReferenceTQModelState(const std::shared_ptr<VecSimAllocator> &alloc
         allocator, TQCodecConfig::DenseReference(dim, total_bits, projections, seed, use_rotation));
 }
 
+inline std::shared_ptr<const TQModelState>
+AllocateFastStructuredRotationTQModelState(const std::shared_ptr<VecSimAllocator> &allocator,
+                                           size_t dim, size_t total_bits, size_t projections,
+                                           uint64_t seed) {
+    return AllocateTQModelState(
+        allocator, TQCodecConfig::FastStructuredRotation(dim, total_bits, projections, seed));
+}
+
 template <typename T>
 struct AllocateSharedSizeProbe {
     alignas(T) std::byte bytes[sizeof(T)];
@@ -1011,18 +1055,35 @@ inline size_t EstimateTQModelAllocationSize(const TQCodecConfig &config) {
     ValidateTQCodecConfig(config);
     size_t estimate = GetTQModelSharedAllocationSize();
     const size_t levels = size_t{1} << config.mse_bits;
-    const size_t matrix_elements = CheckedMultiply(config.dimension, config.dimension,
-                                                   "TurboQuant dense rotation estimate overflow");
-    const size_t qjl_elements = CheckedMultiply(config.projections, config.dimension,
-                                                "TurboQuant dense QJL estimate overflow");
-    const size_t persistent_element_counts[] = {levels, levels - 1, matrix_elements,
-                                                matrix_elements, qjl_elements};
-    for (size_t count : persistent_element_counts) {
+    const auto add_allocation = [&estimate](size_t count, size_t element_size) {
         const size_t allocation = EstimateTrackedAllocation(
-            CheckedBytes(count, sizeof(float), "TurboQuant model allocation estimate overflow"));
+            CheckedBytes(count, element_size, "TurboQuant model allocation estimate overflow"));
         estimate =
             CheckedAdd(estimate, allocation, "TurboQuant model allocation estimate overflow");
+    };
+
+    add_allocation(levels, sizeof(float));
+    add_allocation(levels - 1, sizeof(float));
+    switch (config.rotation_backend_version) {
+    case TQRotationBackendVersion::DenseHaarV1: {
+        const size_t matrix_elements = CheckedMultiply(
+            config.dimension, config.dimension, "TurboQuant dense rotation estimate overflow");
+        add_allocation(matrix_elements, sizeof(float));
+        add_allocation(matrix_elements, sizeof(float));
+        break;
     }
+    case TQRotationBackendVersion::FastStructuredV1:
+        for (size_t stage = 0; stage < 3; ++stage) {
+            add_allocation(config.dimension, sizeof(int8_t));
+            add_allocation(config.dimension, sizeof(size_t));
+            add_allocation(config.dimension, sizeof(size_t));
+        }
+        break;
+    }
+
+    const size_t qjl_elements = CheckedMultiply(config.projections, config.dimension,
+                                                "TurboQuant dense QJL estimate overflow");
+    add_allocation(qjl_elements, sizeof(float));
     return estimate;
 }
 
@@ -1030,6 +1091,13 @@ inline size_t EstimateDenseReferenceTQModelAllocationSize(size_t dim, size_t tot
                                                           size_t projections, uint64_t seed = 0) {
     return EstimateTQModelAllocationSize(
         TQCodecConfig::DenseReference(dim, total_bits, projections, seed));
+}
+
+inline size_t EstimateFastStructuredRotationTQModelAllocationSize(size_t dim, size_t total_bits,
+                                                                  size_t projections,
+                                                                  uint64_t seed = 0) {
+    return EstimateTQModelAllocationSize(
+        TQCodecConfig::FastStructuredRotation(dim, total_bits, projections, seed));
 }
 
 } // namespace TQFlatDetails

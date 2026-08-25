@@ -806,7 +806,6 @@ TEST(TQModelVersionTest, unsupported_component_and_profile_versions_fail_without
     config = TQFlatDetails::TQCodecConfig::DenseReference(8, 4, 8, 17);
     config.model_transform_version =
         TQFlatDetails::TQModelTransformVersion::FastStructuredRotationV1;
-    config.rotation_backend_version = TQFlatDetails::TQRotationBackendVersion::FastStructuredV1;
     EXPECT_THROW(TQFlatDetails::AllocateTQModelState(allocator, config), std::invalid_argument);
     EXPECT_EQ(allocator->getAllocationSize(), baseline);
 
