@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -100,6 +101,10 @@ struct Result {
     std::string operation;
     std::string status = "ok";
     std::string note;
+    std::string transform_version = "not_applicable";
+    std::string qjl_version = "not_applicable";
+    std::string model_profile_version = "not_applicable";
+    std::string stored_distance_version = "not_applicable";
     size_t dim = 0;
     size_t bits = 0;
     VecSimMetric metric = VecSimMetric_IP;
@@ -300,12 +305,13 @@ TQHNSWParams TqHnswParams(size_t dim, size_t bits, VecSimMetric metric, size_t c
             .epsilon = 0.0};
 }
 
-VecSimIndex *NewTqFlat(size_t dim, size_t bits, VecSimMetric metric, size_t capacity) {
+TQFlatDetails::TQFlatIndex *NewTqFlat(size_t dim, size_t bits, VecSimMetric metric,
+                                      size_t capacity) {
     VecSimParams params = {
         .algo = VecSimAlgo_TQ,
         .algoParams = {.tqFlatParams = TqFlatParams(dim, bits, metric, capacity)},
         .logCtx = nullptr};
-    return VecSimIndex_New(&params);
+    return static_cast<TQFlatDetails::TQFlatIndex *>(VecSimIndex_New(&params));
 }
 
 size_t TqStorageBlobSize(size_t dim, size_t bits) {
@@ -461,6 +467,54 @@ std::pair<double, double> Timed(size_t repetitions, Function &&function) {
     return {Percentile(samples, 0.50), Percentile(samples, 0.95)};
 }
 
+struct TimingSummary {
+    double median_ns;
+    double p95_ns;
+    size_t sample_count;
+};
+
+template <typename Items, typename Prepare, typename Function>
+TimingSummary TimedEachPrepared(size_t repetitions, const Items &items, Prepare &&prepare,
+                                Function &&function) {
+    if (items.empty()) {
+        throw std::invalid_argument("benchmark timing requires at least one item");
+    }
+    for (const auto &item : items) {
+        prepare(item);
+        function(item); // Warm every query represented by the recorded distribution.
+    }
+    if (repetitions > std::numeric_limits<size_t>::max() / items.size()) {
+        throw std::overflow_error("benchmark timing sample count overflow");
+    }
+    const size_t sample_count = repetitions * items.size();
+    std::vector<double> samples;
+    samples.reserve(sample_count);
+    for (size_t repetition = 0; repetition < repetitions; ++repetition) {
+        for (const auto &item : items) {
+            prepare(item);
+            const auto begin = Clock::now();
+            function(item);
+            const auto end = Clock::now();
+            samples.push_back(std::chrono::duration<double, std::nano>(end - begin).count());
+        }
+    }
+    return {.median_ns = Percentile(samples, 0.50),
+            .p95_ns = Percentile(samples, 0.95),
+            .sample_count = sample_count};
+}
+
+template <typename Items, typename Function>
+TimingSummary TimedEach(size_t repetitions, const Items &items, Function &&function) {
+    return TimedEachPrepared(
+        repetitions, items, [](const auto &) {}, std::forward<Function>(function));
+}
+
+void ApplyTiming(Result &result, const TimingSummary &timing) {
+    result.median_ns = timing.median_ns;
+    result.p95_ns = timing.p95_ns;
+    result.sample_count = timing.sample_count;
+}
+
 template <typename Setup, typename Function, typename Teardown>
 std::pair<double, double> TimedPrepared(size_t repetitions, Setup &&setup, Function &&function,
                                         Teardown &&teardown) {
@@ -545,17 +599,26 @@ Result BaseResult(std::string implementation, std::string operation, size_t dim,
                   VecSimMetric metric, Distribution distribution, const Config &config);
 std::string RunProfile(const Config &config);
 
-ErrorStats CompareWithExactFp32(VecSimIndex *index, const std::vector<std::vector<float>> &queries,
+ErrorStats CompareWithExactFp32(TQFlatDetails::TQFlatIndex *index,
+                                const std::vector<std::vector<float>> &queries,
                                 const std::vector<std::vector<float>> &corpus,
                                 VecSimMetric metric) {
+#ifdef BUILD_TESTS
+    const size_t preprocessing_before = TQFlatDetails::GetQueryPreprocessingCount();
+#endif
     std::vector<double> absolute_errors;
+    absolute_errors.reserve(queries.size() * corpus.size());
     double signed_sum = 0.0;
     double absolute_sum = 0.0;
     double squared_sum = 0.0;
     for (const auto &query : queries) {
+        // This benchmark populates monotonically increasing labels into an empty single-value
+        // flat index, so label and internal id are identical. Preprocess once, then reuse the
+        // cached stored-to-query dispatch for the complete candidate loop.
+        const auto processed_query = index->preprocessQuery(query.data(), true);
         for (size_t label = 0; label < corpus.size(); ++label) {
-            const double approximate =
-                VecSimIndex_GetDistanceFrom_Unsafe(index, label, query.data());
+            const double approximate = index->calcDistanceForQuery(
+                index->getDataByInternalId(label), processed_query.get());
             // Candidate calculators return distance.  exact - approximate distance is the
             // corresponding approximate - exact similarity estimator bias.
             const double error = ExactDistance(query, corpus[label], metric) - approximate;
@@ -565,6 +628,11 @@ ErrorStats CompareWithExactFp32(VecSimIndex *index, const std::vector<std::vecto
             absolute_errors.push_back(std::abs(error));
         }
     }
+#ifdef BUILD_TESTS
+    if (TQFlatDetails::GetQueryPreprocessingCount() - preprocessing_before != queries.size()) {
+        throw std::runtime_error("dense quality benchmark did not preprocess each query once");
+    }
+#endif
     const double count = static_cast<double>(absolute_errors.size());
     return {.signed_bias = signed_sum / count,
             .mae = absolute_sum / count,
@@ -679,14 +747,13 @@ Result MeasureQueryPreprocess(const Config &config, std::string implementation, 
         TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, bits, dim, kSeed, true);
     result.model_bytes = allocator->getAllocationSize() - allocator_baseline;
     TQFlatDetails::TQPreprocessor<Metric> preprocessor(allocator, state);
-    std::tie(result.median_ns, result.p95_ns) = Timed(config.repetitions, [&] {
-        void *blob = nullptr;
-        size_t blob_size = 0;
-        preprocessor.preprocessQuery(queries.front().data(), blob, blob_size, alignof(float));
-        result.checksum += static_cast<double>(blob_size);
-        allocator->free_allocation(blob);
-    });
-    result.sample_count = config.repetitions;
+    ApplyTiming(result, TimedEach(config.repetitions, queries, [&](const auto &query) {
+                    void *blob = nullptr;
+                    size_t blob_size = 0;
+                    preprocessor.preprocessQuery(query.data(), blob, blob_size, alignof(float));
+                    result.checksum += static_cast<double>(blob_size);
+                    allocator->free_allocation(blob);
+                }));
     result.allocator_total_bytes = allocator->getAllocationSize() - allocator_baseline;
     result.note = "allocation is part of query-context creation, not stored scoring";
     return result;
@@ -714,19 +781,30 @@ Result MeasureStoredToQuery(const Config &config, std::string implementation, si
         preprocessor.preprocessForStorage(vector.data(), blob, blob_size, alignof(float));
         encoded.push_back(blob);
     }
-    void *query_blob = nullptr;
-    size_t query_blob_size = 0;
-    preprocessor.preprocessQuery(queries.front().data(), query_blob, query_blob_size,
-                                 alignof(float));
+    auto query_context = preprocessor.createOperationContext();
+    auto query_blob_owner =
+        allocator->allocate_aligned_unique(state->queryBlobSize(), alignof(float));
+    if (!query_blob_owner) {
+        throw std::bad_alloc();
+    }
+    void *query_blob = query_blob_owner.get();
+    size_t query_blob_size = state->queryBlobSize();
 #ifdef BUILD_TESTS
     const uint64_t allocations_before = allocator->getAllocationCount();
 #endif
-    std::tie(result.median_ns, result.p95_ns) = Timed(config.repetitions, [&] {
-        for (void *blob : encoded) {
-            result.checksum += calculator.calcDistanceForQuery(blob, query_blob, dim);
-        }
-    });
-    result.sample_count = config.repetitions;
+    ApplyTiming(result, TimedEachPrepared(
+                            config.repetitions, queries,
+                            [&](const auto &query) {
+                                preprocessor.preprocessQueryWithContext(
+                                    query.data(), query_blob, query_blob_size, alignof(float),
+                                    query_context);
+                            },
+                            [&](const auto &) {
+                                for (void *blob : encoded) {
+                                    result.checksum +=
+                                        calculator.calcDistanceForQuery(blob, query_blob, dim);
+                                }
+                            }));
 #ifdef BUILD_TESTS
     const uint64_t allocations_after = allocator->getAllocationCount();
     const uint64_t allocation_delta = allocations_after - allocations_before;
@@ -738,7 +816,6 @@ Result MeasureStoredToQuery(const Config &config, std::string implementation, si
     result.note = "allocator call counter unavailable in this build";
 #endif
     result.allocator_total_bytes = allocator->getAllocationSize() - allocator_baseline;
-    allocator->free_allocation(query_blob);
     for (void *blob : encoded) {
         allocator->free_allocation(blob);
     }
@@ -823,42 +900,55 @@ std::string JsonEscape(std::string_view value) {
     return escaped;
 }
 
-std::string TransformVersion(std::string_view implementation) {
-    if (implementation == "FP32Exact") {
-        return "not_applicable";
+std::string TransformVersion(TQFlatDetails::TQRotationBackendVersion version) {
+    switch (version) {
+    case TQFlatDetails::TQRotationBackendVersion::DenseHaarV1:
+        return "DenseHaarV1";
+    case TQFlatDetails::TQRotationBackendVersion::FastStructuredV1:
+        return "FastStructuredRotationV1";
     }
-    if (implementation.find("CirculantGaussianQjlV1") != std::string_view::npos) {
+    throw std::invalid_argument("unknown TurboQuant rotation backend identity");
+}
+
+std::string QjlVersion(TQFlatDetails::TQQjlBackendVersion version) {
+    switch (version) {
+    case TQFlatDetails::TQQjlBackendVersion::DenseGaussianV1:
+        return "DenseGaussianQjlV1";
+    case TQFlatDetails::TQQjlBackendVersion::CirculantGaussianV1:
+        return "CirculantGaussianQjlV1";
+    }
+    throw std::invalid_argument("unknown TurboQuant QJL backend identity");
+}
+
+std::string ModelProfileVersion(TQFlatDetails::TQModelTransformVersion version) {
+    switch (version) {
+    case TQFlatDetails::TQModelTransformVersion::DenseReferenceV1:
+        return "DenseReferenceV1";
+    case TQFlatDetails::TQModelTransformVersion::FastStructuredRotationV1:
+        return "FastStructuredRotationV1";
+    case TQFlatDetails::TQModelTransformVersion::FastStructuredV1:
         return "FastStructuredV1";
     }
-    return implementation.find("FastStructuredRotationV1") != std::string_view::npos
-               ? "FastStructuredRotationV1"
-               : "DenseReferenceV1";
+    throw std::invalid_argument("unknown TurboQuant model profile identity");
 }
 
-std::string QjlVersion(std::string_view implementation) {
-    if (implementation == "FP32Exact") {
-        return "not_applicable";
+std::string StoredDistanceVersion(TQFlatDetails::TQStoredDistanceMode mode) {
+    switch (mode) {
+    case TQFlatDetails::TQStoredDistanceMode::FullDecodeReference:
+        return "FullDecodeReferenceV1";
+    case TQFlatDetails::TQStoredDistanceMode::CoarseMse:
+        return "CoarseMseV1";
     }
-    return implementation.find("CirculantGaussianQjlV1") != std::string_view::npos
-               ? "CirculantGaussianQjlV1"
-               : "DenseGaussianQjlV1";
+    throw std::invalid_argument("unknown TurboQuant construction score identity");
 }
 
-std::string ModelProfileVersion(std::string_view implementation) {
-    if (implementation == "FP32Exact") {
-        return "not_applicable";
-    }
-    return implementation.find("CirculantGaussianQjlV1") != std::string_view::npos
-               ? "FastStructuredV1"
-               : TransformVersion(implementation);
-}
-
-std::string StoredDistanceVersion(std::string_view implementation) {
-    if (implementation == "FP32Exact") {
-        return "not_applicable";
-    }
-    return implementation.find("CoarseMse") != std::string_view::npos ? "CoarseMseV1"
-                                                                      : "FullDecodeReferenceV1";
+void ApplyTqIdentity(Result &result, const TQFlatDetails::TQCodecConfig &config,
+                     TQFlatDetails::TQStoredDistanceMode stored_distance_mode) {
+    TQFlatDetails::ValidateTQCodecConfig(config);
+    result.transform_version = TransformVersion(config.rotation_backend_version);
+    result.qjl_version = QjlVersion(config.qjl_backend_version);
+    result.model_profile_version = ModelProfileVersion(config.model_transform_version);
+    result.stored_distance_version = StoredDistanceVersion(stored_distance_mode);
 }
 
 std::string RunProfile(const Config &config) {
@@ -907,11 +997,19 @@ double TimedWorkItems(const Result &result) {
 }
 
 void PrintJson(const Result &result, const Metadata &metadata) {
+    const bool exact_fp32 = result.implementation == "FP32Exact";
+    const bool identity_not_applicable = result.transform_version == "not_applicable" ||
+                                         result.qjl_version == "not_applicable" ||
+                                         result.model_profile_version == "not_applicable" ||
+                                         result.stored_distance_version == "not_applicable";
     if (metadata.git_commit.empty() || metadata.git_dirty.empty() || metadata.compiler.empty() ||
         metadata.build_mode.empty() || metadata.cpu_model.empty() ||
         metadata.architecture.empty() || metadata.simd.empty() || metadata.assertions.empty() ||
         result.implementation.empty() || result.run_profile.empty() || result.operation.empty() ||
-        result.dim == 0 || result.corpus_size == 0 || result.query_count == 0) {
+        result.transform_version.empty() || result.qjl_version.empty() ||
+        result.model_profile_version.empty() || result.stored_distance_version.empty() ||
+        result.dim == 0 || result.corpus_size == 0 || result.query_count == 0 ||
+        (!exact_fp32 && identity_not_applicable)) {
         throw std::runtime_error("benchmark result is missing required reproducibility metadata");
     }
     std::cout << std::setprecision(12) << "{\"git_commit\":\"" << JsonEscape(metadata.git_commit)
@@ -925,10 +1023,10 @@ void PrintJson(const Result &result, const Metadata &metadata) {
               << "\",\"run_profile\":\"" << JsonEscape(result.run_profile) << "\",\"operation\":\""
               << JsonEscape(result.operation) << "\",\"status\":\"" << JsonEscape(result.status)
               << "\",\"note\":\"" << JsonEscape(result.note) << "\",\"transform_version\":\""
-              << TransformVersion(result.implementation) << "\",\"model_profile_version\":\""
-              << ModelProfileVersion(result.implementation) << "\",\"qjl_version\":\""
-              << QjlVersion(result.implementation) << "\",\"stored_distance_version\":\""
-              << StoredDistanceVersion(result.implementation) << "\",\"dim\":" << result.dim
+              << JsonEscape(result.transform_version) << "\",\"model_profile_version\":\""
+              << JsonEscape(result.model_profile_version) << "\",\"qjl_version\":\""
+              << JsonEscape(result.qjl_version) << "\",\"stored_distance_version\":\""
+              << JsonEscape(result.stored_distance_version) << "\",\"dim\":" << result.dim
               << ",\"metric\":\"" << MetricName(result.metric) << "\",\"bits\":" << result.bits
               << ",\"distribution\":\"" << DistributionName(result.distribution)
               << "\",\"seed\":" << kSeed << ",\"corpus_size\":" << result.corpus_size
@@ -1069,6 +1167,30 @@ void VerifyPayloadAndChecksum() {
 #endif
 }
 
+void VerifyTqIdentityMetadata() {
+    const auto verify = [](const TQFlatDetails::TQCodecConfig &config,
+                           TQFlatDetails::TQStoredDistanceMode stored_distance_mode,
+                           std::string_view transform, std::string_view qjl,
+                           std::string_view model_profile, std::string_view construction) {
+        Result result;
+        ApplyTqIdentity(result, config, stored_distance_mode);
+        if (result.transform_version != transform || result.qjl_version != qjl ||
+            result.model_profile_version != model_profile ||
+            result.stored_distance_version != construction) {
+            throw std::runtime_error("TurboQuant benchmark identity metadata mismatch");
+        }
+    };
+    verify(TQFlatDetails::TQCodecConfig::DenseReference(8, 4, 8, kSeed, true),
+           TQFlatDetails::TQStoredDistanceMode::FullDecodeReference, "DenseHaarV1",
+           "DenseGaussianQjlV1", "DenseReferenceV1", "FullDecodeReferenceV1");
+    verify(TQFlatDetails::TQCodecConfig::FastStructuredRotation(8, 4, 8, kSeed),
+           TQFlatDetails::TQStoredDistanceMode::CoarseMse, "FastStructuredRotationV1",
+           "DenseGaussianQjlV1", "FastStructuredRotationV1", "CoarseMseV1");
+    verify(TQFlatDetails::TQCodecConfig::FastStructured(8, 4, 8, kSeed),
+           TQFlatDetails::TQStoredDistanceMode::CoarseMse, "FastStructuredRotationV1",
+           "CirculantGaussianQjlV1", "FastStructuredV1", "CoarseMseV1");
+}
+
 void ApplyGraphIntegrity(Result &result, const TQTypedHNSWIndex &index) {
     const HNSWIndexMetaData integrity = index.checkIntegrity();
     result.graph_integrity_status = integrity.valid_state ? "valid" : "invalid";
@@ -1113,26 +1235,25 @@ void RunFp32ExactBaseline(const Config &config, const Metadata &metadata, size_t
                               distribution, config);
     score.payload_bytes = dim * sizeof(float);
     score.metadata_bytes = 0;
-    std::tie(score.median_ns, score.p95_ns) = Timed(config.repetitions, [&] {
-        for (const auto &candidate : corpus) {
-            score.checksum += ExactDistance(queries.front(), candidate, metric);
-        }
-    });
-    score.sample_count = config.repetitions;
+    ApplyTiming(score, TimedEach(config.repetitions, queries, [&](const auto &query) {
+                    for (const auto &candidate : corpus) {
+                        score.checksum += ExactDistance(query, candidate, metric);
+                    }
+                }));
     score.allocator_total_bytes = VecSimIndex_StatsInfo(index).memory;
     PrintJson(score, metadata);
     Result scan =
         BaseResult("FP32Exact", "flat_scan_exact_baseline", dim, 32, metric, distribution, config);
     scan.payload_bytes = dim * sizeof(float);
     scan.metadata_bytes = 0;
-    std::tie(scan.median_ns, scan.p95_ns) = Timed(config.repetitions, [&] {
-        auto reply = VecSimIndex_TopKQuery(index, queries.front().data(), kTopK, nullptr, BY_SCORE);
-        for (size_t label : Labels(reply)) {
-            scan.checksum += static_cast<double>(label);
-        }
-        VecSimQueryReply_Free(reply);
-    });
-    scan.sample_count = config.repetitions;
+    ApplyTiming(scan, TimedEach(config.repetitions, queries, [&](const auto &query) {
+                    auto reply =
+                        VecSimIndex_TopKQuery(index, query.data(), kTopK, nullptr, BY_SCORE);
+                    for (size_t label : Labels(reply)) {
+                        scan.checksum += static_cast<double>(label);
+                    }
+                    VecSimQueryReply_Free(reply);
+                }));
     scan.recall_at_10 = 1.0;
     scan.allocator_total_bytes = VecSimIndex_StatsInfo(index).memory;
     PrintJson(scan, metadata);
@@ -1191,14 +1312,14 @@ void RunExplicitStructuredForMetric(const Config &config, const Metadata &metada
     auto query_state = fast_state_factory(query_allocator);
     query_preprocess.model_bytes = query_allocator->getAllocationSize() - query_baseline;
     TQFlatDetails::TQPreprocessor<Metric> query_preprocessor(query_allocator, query_state);
-    std::tie(query_preprocess.median_ns, query_preprocess.p95_ns) = Timed(config.repetitions, [&] {
-        void *blob = nullptr;
-        size_t blob_size = 0;
-        query_preprocessor.preprocessQuery(queries.front().data(), blob, blob_size, alignof(float));
-        query_preprocess.checksum += blob_size;
-        query_allocator->free_allocation(blob);
-    });
-    query_preprocess.sample_count = config.repetitions;
+    ApplyTiming(query_preprocess, TimedEach(config.repetitions, queries, [&](const auto &query) {
+                    void *blob = nullptr;
+                    size_t blob_size = 0;
+                    query_preprocessor.preprocessQuery(query.data(), blob, blob_size,
+                                                       alignof(float));
+                    query_preprocess.checksum += blob_size;
+                    query_allocator->free_allocation(blob);
+                }));
     query_preprocess.allocator_total_bytes = query_allocator->getAllocationSize() - query_baseline;
     query_preprocess.note = "direct FastStructuredRotationV1 query preprocessing";
     results.push_back(query_preprocess);
@@ -1220,19 +1341,30 @@ void RunExplicitStructuredForMetric(const Config &config, const Metadata &metada
         score_preprocessor.preprocessForStorage(vector.data(), blob, blob_size, alignof(float));
         encoded.push_back(blob);
     }
-    void *query_blob = nullptr;
-    size_t query_blob_size = 0;
-    score_preprocessor.preprocessQuery(queries.front().data(), query_blob, query_blob_size,
-                                       alignof(float));
+    auto query_context = score_preprocessor.createOperationContext();
+    auto query_blob_owner =
+        score_allocator->allocate_aligned_unique(score_state->queryBlobSize(), alignof(float));
+    if (!query_blob_owner) {
+        throw std::bad_alloc();
+    }
+    void *query_blob = query_blob_owner.get();
+    size_t query_blob_size = score_state->queryBlobSize();
 #ifdef BUILD_TESTS
     const uint64_t allocations_before = score_allocator->getAllocationCount();
 #endif
-    std::tie(score.median_ns, score.p95_ns) = Timed(config.repetitions, [&] {
-        for (void *blob : encoded) {
-            score.checksum += score_calculator.calcDistanceForQuery(blob, query_blob, dim);
-        }
-    });
-    score.sample_count = config.repetitions;
+    ApplyTiming(score, TimedEachPrepared(
+                           config.repetitions, queries,
+                           [&](const auto &query) {
+                               score_preprocessor.preprocessQueryWithContext(
+                                   query.data(), query_blob, query_blob_size, alignof(float),
+                                   query_context);
+                           },
+                           [&](const auto &) {
+                               for (void *blob : encoded) {
+                                   score.checksum +=
+                                       score_calculator.calcDistanceForQuery(blob, query_blob, dim);
+                               }
+                           }));
 #ifdef BUILD_TESTS
     const uint64_t allocation_delta = score_allocator->getAllocationCount() - allocations_before;
     score.note = "vecsim_allocations_in_hot_path=" + std::to_string(allocation_delta);
@@ -1244,7 +1376,6 @@ void RunExplicitStructuredForMetric(const Config &config, const Metadata &metada
     for (void *blob : encoded) {
         score_allocator->free_allocation(blob);
     }
-    score_allocator->free_allocation(query_blob);
     results.push_back(score);
 
     Result stored_score = BaseResult(implementation, "stored_to_stored_construction_score", dim,
@@ -1313,14 +1444,14 @@ void RunExplicitStructuredForMetric(const Config &config, const Metadata &metada
                                             TQFlatDetails::TQStoredDistanceMode::CoarseMse);
     Populate(flat, corpus);
     Result scan = BaseResult(implementation, "flat_scan", dim, bits, Metric, distribution, config);
-    std::tie(scan.median_ns, scan.p95_ns) = Timed(config.repetitions, [&] {
-        auto reply = VecSimIndex_TopKQuery(flat, queries.front().data(), kTopK, nullptr, BY_SCORE);
-        for (size_t label : Labels(reply)) {
-            scan.checksum += static_cast<double>(label);
-        }
-        VecSimQueryReply_Free(reply);
-    });
-    scan.sample_count = config.repetitions;
+    ApplyTiming(scan, TimedEach(config.repetitions, queries, [&](const auto &query) {
+                    auto reply =
+                        VecSimIndex_TopKQuery(flat, query.data(), kTopK, nullptr, BY_SCORE);
+                    for (size_t label : Labels(reply)) {
+                        scan.checksum += static_cast<double>(label);
+                    }
+                    VecSimQueryReply_Free(reply);
+                }));
     scan.allocator_total_bytes = VecSimIndex_StatsInfo(flat).memory;
     scan.model_bytes = create.model_bytes;
     results.push_back(scan);
@@ -1350,15 +1481,14 @@ void RunExplicitStructuredForMetric(const Config &config, const Metadata &metada
                               Metric, distribution, config);
     HNSWRuntimeParams runtime = {.efRuntime = kEfRuntime};
     VecSimQueryParams query_params = {.hnswRuntimeParams = runtime};
-    std::tie(query.median_ns, query.p95_ns) = Timed(config.repetitions, [&] {
-        auto reply =
-            VecSimIndex_TopKQuery(hnsw, queries.front().data(), kTopK, &query_params, BY_SCORE);
-        for (size_t label : Labels(reply)) {
-            query.checksum += static_cast<double>(label);
-        }
-        VecSimQueryReply_Free(reply);
-    });
-    query.sample_count = config.repetitions;
+    ApplyTiming(query, TimedEach(config.repetitions, queries, [&](const auto &query_vector) {
+                    auto reply = VecSimIndex_TopKQuery(hnsw, query_vector.data(), kTopK,
+                                                       &query_params, BY_SCORE);
+                    for (size_t label : Labels(reply)) {
+                        query.checksum += static_cast<double>(label);
+                    }
+                    VecSimQueryReply_Free(reply);
+                }));
     query.recall_at_10 = RecallAt10(hnsw, queries, corpus, Metric);
     query.allocator_total_bytes = VecSimIndex_StatsInfo(hnsw).memory;
     query.model_bytes = create.model_bytes;
@@ -1420,7 +1550,8 @@ void RunExplicitStructuredForMetric(const Config &config, const Metadata &metada
     VecSimIndex_Free(hnsw);
     VecSimIndex_Free(flat);
 
-    for (const Result &result : results) {
+    for (Result &result : results) {
+        ApplyTqIdentity(result, codec_config, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
         PrintJson(result, metadata);
     }
 }
@@ -1448,6 +1579,8 @@ void RunDenseReference(const Config &config, const Metadata &metadata, size_t di
     const auto stored_distance_mode =
         coarse_mse ? TQFlatDetails::TQStoredDistanceMode::CoarseMse
                    : TQFlatDetails::TQStoredDistanceMode::FullDecodeReference;
+    const auto codec_config =
+        TQFlatDetails::TQCodecConfig::DenseReference(dim, bits, dim, kSeed, true);
     const auto corpus = MakeCorpusDataset(config, dim, distribution);
     const auto queries = MakeQueryDataset(config, dim, distribution);
     std::vector<Result> results;
@@ -1496,14 +1629,14 @@ void RunDenseReference(const Config &config, const Metadata &metadata, size_t di
     results.push_back(query_preprocess);
 
     Result scan = BaseResult(implementation, "flat_scan", dim, bits, metric, distribution, config);
-    std::tie(scan.median_ns, scan.p95_ns) = Timed(config.repetitions, [&] {
-        auto reply = VecSimIndex_TopKQuery(flat, queries.front().data(), kTopK, nullptr, BY_SCORE);
-        for (size_t label : Labels(reply)) {
-            scan.checksum += static_cast<double>(label);
-        }
-        VecSimQueryReply_Free(reply);
-    });
-    scan.sample_count = config.repetitions;
+    ApplyTiming(scan, TimedEach(config.repetitions, queries, [&](const auto &query) {
+                    auto reply =
+                        VecSimIndex_TopKQuery(flat, query.data(), kTopK, nullptr, BY_SCORE);
+                    for (size_t label : Labels(reply)) {
+                        scan.checksum += static_cast<double>(label);
+                    }
+                    VecSimQueryReply_Free(reply);
+                }));
     scan.allocator_total_bytes = VecSimIndex_StatsInfo(flat).memory;
     scan.model_bytes = create.model_bytes;
     results.push_back(scan);
@@ -1541,15 +1674,14 @@ void RunDenseReference(const Config &config, const Metadata &metadata, size_t di
                               metric, distribution, config);
     HNSWRuntimeParams runtime = {.efRuntime = kEfRuntime};
     VecSimQueryParams query_params = {.hnswRuntimeParams = runtime};
-    std::tie(query.median_ns, query.p95_ns) = Timed(config.repetitions, [&] {
-        auto reply =
-            VecSimIndex_TopKQuery(hnsw, queries.front().data(), kTopK, &query_params, BY_SCORE);
-        for (size_t label : Labels(reply)) {
-            query.checksum += static_cast<double>(label);
-        }
-        VecSimQueryReply_Free(reply);
-    });
-    query.sample_count = config.repetitions;
+    ApplyTiming(query, TimedEach(config.repetitions, queries, [&](const auto &query_vector) {
+                    auto reply = VecSimIndex_TopKQuery(hnsw, query_vector.data(), kTopK,
+                                                       &query_params, BY_SCORE);
+                    for (size_t label : Labels(reply)) {
+                        query.checksum += static_cast<double>(label);
+                    }
+                    VecSimQueryReply_Free(reply);
+                }));
     query.recall_at_10 = RecallAt10(hnsw, queries, corpus, metric);
     query.allocator_total_bytes = VecSimIndex_StatsInfo(hnsw).memory;
     query.model_bytes = create.model_bytes;
@@ -1607,7 +1739,8 @@ void RunDenseReference(const Config &config, const Metadata &metadata, size_t di
 
     VecSimIndex_Free(hnsw);
     VecSimIndex_Free(flat);
-    for (const Result &result : results) {
+    for (Result &result : results) {
+        ApplyTqIdentity(result, codec_config, stored_distance_mode);
         PrintJson(result, metadata);
     }
 }
@@ -1734,6 +1867,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         VerifyPayloadAndChecksum();
+        VerifyTqIdentityMetadata();
         const std::vector<size_t> dimensions =
             config.mode == RunMode::Smoke
                 ? std::vector<size_t>{8}
