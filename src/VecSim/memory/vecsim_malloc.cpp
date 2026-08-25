@@ -37,6 +37,9 @@ void *VecSimAllocator::allocate(size_t size) {
     auto ptr = static_cast<VecSimAllocationHeader *>(vecsim_malloc(size + allocation_header_size));
     if (ptr) {
         this->allocated += size + allocation_header_size;
+#ifdef BUILD_TESTS
+        ++this->allocation_count;
+#endif
         *ptr = {size, false};
         return ptr + 1;
     }
@@ -52,6 +55,9 @@ void *VecSimAllocator::allocate_aligned(size_t size, unsigned char alignment) {
     auto ptr = static_cast<unsigned char *>(vecsim_malloc(size + allocation_header_size));
     if (ptr) {
         this->allocated += size + allocation_header_size;
+#ifdef BUILD_TESTS
+        ++this->allocation_count;
+#endif
         size_t remainder = (((uintptr_t)ptr) + allocation_header_size) % alignment;
         unsigned char offset = alignment - remainder;
         // Store the allocation header in the 8 bytes before the returned pointer.
@@ -96,6 +102,9 @@ void *VecSimAllocator::callocate(size_t size) {
 
     if (ptr) {
         this->allocated += size + allocation_header_size;
+#ifdef BUILD_TESTS
+        ++this->allocation_count;
+#endif
         *ptr = size;
         return ptr + 1;
     }
@@ -120,3 +129,7 @@ void VecSimAllocator::operator delete(void *p, size_t size) { vecsim_free(p); }
 void VecSimAllocator::operator delete[](void *p, size_t size) { vecsim_free(p); }
 
 uint64_t VecSimAllocator::getAllocationSize() const { return this->allocated; }
+
+#ifdef BUILD_TESTS
+uint64_t VecSimAllocator::getAllocationCount() const { return this->allocation_count; }
+#endif

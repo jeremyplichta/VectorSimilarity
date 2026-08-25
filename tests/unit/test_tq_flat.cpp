@@ -11,6 +11,7 @@
 
 #include "VecSim/algorithms/hnsw/hnsw_serializer.h"
 #include "VecSim/algorithms/tq/tq_flat.h"
+#include "VecSim/algorithms/tq/tq_hnsw.h"
 #include "VecSim/vec_sim.h"
 #include "tq_paper_reference.h"
 
@@ -77,6 +78,88 @@ std::vector<std::pair<size_t, double>> TopK(VecSimIndex *index, const float *que
     VecSimQueryReply_IteratorFree(iterator);
     VecSimQueryReply_Free(reply);
     return results;
+}
+
+std::vector<double>
+ReferenceCoarseReconstruction(const tq_paper_reference::ReferenceDenseModel &model,
+                              const tq_paper_reference::ReferenceEncoded &encoded,
+                              std::span<const float> centroids) {
+    std::vector<double> rotated(model.dim());
+    for (size_t i = 0; i < model.dim(); ++i) {
+        rotated[i] = centroids[encoded.indices[i]];
+    }
+    return model.inverseRotate(rotated);
+}
+
+double ReferenceCoarseDistance(const tq_paper_reference::ReferenceDenseModel &model,
+                               const tq_paper_reference::ReferenceEncoded &lhs,
+                               const tq_paper_reference::ReferenceEncoded &rhs,
+                               tq_paper_reference::Metric metric,
+                               std::span<const float> centroids) {
+    if (lhs.alpha == 0.0 || rhs.alpha == 0.0) {
+        return 1.0;
+    }
+    const auto lhs_coarse = ReferenceCoarseReconstruction(model, lhs, centroids);
+    const auto rhs_coarse = ReferenceCoarseReconstruction(model, rhs, centroids);
+    const double dot =
+        std::inner_product(lhs_coarse.begin(), lhs_coarse.end(), rhs_coarse.begin(), 0.0);
+    if (metric == tq_paper_reference::Metric::InnerProduct) {
+        return 1.0 - lhs.alpha * rhs.alpha * dot;
+    }
+    const double lhs_norm_sq =
+        std::inner_product(lhs_coarse.begin(), lhs_coarse.end(), lhs_coarse.begin(), 0.0);
+    const double rhs_norm_sq =
+        std::inner_product(rhs_coarse.begin(), rhs_coarse.end(), rhs_coarse.begin(), 0.0);
+    if (lhs_norm_sq == 0.0 || rhs_norm_sq == 0.0) {
+        return 1.0;
+    }
+    return 1.0 - dot / std::sqrt(lhs_norm_sq * rhs_norm_sq);
+}
+
+template <VecSimMetric Metric, bool Multi>
+HNSWIndex<float, float> *CreateInternalCoarseTQHNSW(size_t dim, size_t bits, size_t seed,
+                                                    size_t m = 2) {
+    auto allocator = VecSimAllocator::newVecsimAllocator();
+    TQFlatParams tq_params = {.type = VecSimType_FLOAT32,
+                              .dim = dim,
+                              .metric = Metric,
+                              .multi = Multi,
+                              .initialCapacity = 0,
+                              .blockSize = 16,
+                              .bits = bits,
+                              .projections = dim,
+                              .seed = seed,
+                              .useRotation = true};
+    auto components = TQFlatDetails::CreateTQHNSWComponents<Metric>(
+        allocator, &tq_params, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+    AbstractIndexInitParams abstract_params = {
+        .allocator = allocator,
+        .dim = dim,
+        .vecType = VecSimType_FLOAT32,
+        .storedDataSize = TQFlatDetails::GetStorageDataSize<Metric>(&tq_params),
+        .metric = Metric,
+        .blockSize = tq_params.blockSize,
+        .multi = Multi,
+        .isDisk = false,
+        .logCtx = nullptr,
+        .inputBlobSize = dim * sizeof(float),
+    };
+    HNSWParams hnsw_params = {.type = VecSimType_FLOAT32,
+                              .dim = dim,
+                              .metric = Metric,
+                              .multi = Multi,
+                              .initialCapacity = 0,
+                              .blockSize = tq_params.blockSize,
+                              .M = m,
+                              .efConstruction = 64,
+                              .efRuntime = 32,
+                              .epsilon = 0.01};
+    if constexpr (Multi) {
+        return new (allocator) TQHNSWDetails::TQHNSWIndex_Multi<float, float>(
+            &hnsw_params, abstract_params, components, seed);
+    }
+    return new (allocator) TQHNSWDetails::TQHNSWIndex_Single<float, float>(
+        &hnsw_params, abstract_params, components, seed);
 }
 
 template <VecSimMetric Metric>
@@ -272,6 +355,8 @@ TEST(TQPaperConformanceTest, stored_to_stored_distance_matches_explicit_algorith
     auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, 4, dim, 23, true);
     TQFlatDetails::TQPreprocessor<VecSimMetric_IP> preprocessor(allocator, state);
     TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> calculator(allocator, state);
+    EXPECT_EQ(calculator.getStoredDistanceMode(),
+              TQFlatDetails::TQStoredDistanceMode::FullDecodeReference);
 
     void *lhs_blob = nullptr;
     void *rhs_blob = nullptr;
@@ -289,6 +374,212 @@ TEST(TQPaperConformanceTest, stored_to_stored_distance_matches_explicit_algorith
     EXPECT_NEAR(calculator.calcDistance(lhs_blob, rhs_blob, dim), expected, 1e-6f);
     allocator->free_allocation(lhs_blob);
     allocator->free_allocation(rhs_blob);
+}
+
+TEST(TQCoarseMseTest, internal_mode_has_explicit_stable_version_values) {
+    EXPECT_EQ(TQFlatDetails::kTQStoredDistanceModeVersion, 1);
+    EXPECT_EQ(static_cast<uint8_t>(TQFlatDetails::TQStoredDistanceMode::FullDecodeReference), 1);
+    EXPECT_EQ(static_cast<uint8_t>(TQFlatDetails::TQStoredDistanceMode::CoarseMse), 2);
+}
+
+TEST(TQCoarseMseTest, packed_kernel_matches_independent_explicit_algorithm_one_decode) {
+    for (size_t dim :
+         {size_t{3}, size_t{7}, size_t{8}, size_t{15}, size_t{16}, size_t{31}, size_t{128}}) {
+        for (size_t bits : {size_t{2}, size_t{4}, size_t{8}}) {
+            SCOPED_TRACE(::testing::Message() << "dim=" << dim << " bits=" << bits);
+            constexpr size_t seed = 17;
+            tq_paper_reference::ReferenceDenseModel reference(dim, bits, seed,
+                                                              seed + TQFlatDetails::kQjlSeedOffset);
+            std::vector<float> lhs(dim);
+            std::vector<float> rhs(dim);
+            for (size_t i = 0; i < dim; ++i) {
+                lhs[i] = 2.3f * std::sin(static_cast<float>((i + 1) * 7) * 0.173f);
+                rhs[i] = 0.6f * std::cos(static_cast<float>((i + 3) * 11) * 0.097f);
+            }
+
+            auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, bits, dim, seed, true);
+            auto allocator = VecSimAllocator::newVecsimAllocator();
+            for (auto [reference_metric, vecsim_metric] :
+                 {std::pair{tq_paper_reference::Metric::InnerProduct, VecSimMetric_IP},
+                  std::pair{tq_paper_reference::Metric::Cosine, VecSimMetric_Cosine}}) {
+                const auto lhs_encoded = reference.encode(lhs, reference_metric);
+                const auto rhs_encoded = reference.encode(rhs, reference_metric);
+                std::vector<uint8_t> unaligned_rhs(rhs_encoded.bytes.size() + 1);
+                std::memcpy(unaligned_rhs.data() + 1, rhs_encoded.bytes.data(),
+                            rhs_encoded.bytes.size());
+                const double expected =
+                    ReferenceCoarseDistance(reference, lhs_encoded, rhs_encoded, reference_metric,
+                                            state->centroids);
+
+                float actual;
+                if (vecsim_metric == VecSimMetric_IP) {
+                    TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> calculator(
+                        allocator, state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+                    actual = calculator.calcDistance(lhs_encoded.bytes.data(),
+                                                     unaligned_rhs.data() + 1, dim);
+                } else {
+                    TQFlatDetails::TQDistanceCalculator<VecSimMetric_Cosine> calculator(
+                        allocator, state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+                    actual = calculator.calcDistance(lhs_encoded.bytes.data(),
+                                                     unaligned_rhs.data() + 1, dim);
+                }
+                EXPECT_NEAR(actual, expected, 8e-4 * std::max(1.0, std::abs(expected)));
+            }
+        }
+    }
+}
+
+TEST(TQCoarseMseTest, production_dimension_tail_matches_double_accumulation) {
+    constexpr size_t dim = 1024;
+    for (size_t bits : {size_t{2}, size_t{4}, size_t{8}}) {
+        SCOPED_TRACE(::testing::Message() << "bits=" << bits);
+        auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, bits, dim, 31, false);
+        std::vector<uint8_t> lhs(state->storageBlobSize(), 0);
+        std::vector<uint8_t> rhs_unaligned(state->storageBlobSize() + 1, 0);
+        auto *rhs = rhs_unaligned.data() + 1;
+        for (size_t i = 0; i < dim; ++i) {
+            state->writeMseIndex(lhs.data(), i,
+                                 static_cast<uint16_t>((i * 13 + 1) % state->levels));
+            state->writeMseIndex(rhs, i, static_cast<uint16_t>((i * 29 + 3) % state->levels));
+        }
+        state->writeMetadata(lhs.data(), 2.75f, 99.0f);
+        state->writeMetadata(rhs, 0.625f, 101.0f);
+
+        double dot = 0.0;
+        double lhs_norm_sq = 0.0;
+        double rhs_norm_sq = 0.0;
+        const auto lhs_view = state->storageView(lhs.data());
+        const auto rhs_view = state->storageView(rhs);
+        for (size_t i = 0; i < dim; ++i) {
+            const double lhs_centroid = state->centroids[state->mseIndexAt(lhs_view, i)];
+            const double rhs_centroid = state->centroids[state->mseIndexAt(rhs_view, i)];
+            dot += lhs_centroid * rhs_centroid;
+            lhs_norm_sq += lhs_centroid * lhs_centroid;
+            rhs_norm_sq += rhs_centroid * rhs_centroid;
+        }
+
+        auto allocator = VecSimAllocator::newVecsimAllocator();
+        TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> ip_calculator(
+            allocator, state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+        TQFlatDetails::TQDistanceCalculator<VecSimMetric_Cosine> cosine_calculator(
+            allocator, state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+        EXPECT_NEAR(ip_calculator.calcDistance(lhs.data(), rhs, dim), 1.0 - 2.75 * 0.625 * dot,
+                    3e-4 * std::max(1.0, std::abs(dot)));
+        EXPECT_NEAR(cosine_calculator.calcDistance(lhs.data(), rhs, dim),
+                    1.0 - dot / std::sqrt(lhs_norm_sq * rhs_norm_sq), 2e-5);
+    }
+}
+
+TEST(TQCoarseMseTest, zero_sources_and_query_scoring_preserve_existing_semantics) {
+    constexpr size_t dim = 8;
+    const std::array<float, dim> zero = {};
+    const std::array<float, dim> vector = {1.3f, -0.2f, 0.7f, 0.1f, -0.5f, 0.8f, 0.4f, -0.9f};
+    const std::array<float, dim> query = {-0.1f, 0.6f, 0.2f, -0.7f, 0.9f, 0.3f, -0.4f, 0.5f};
+    for (VecSimMetric metric : {VecSimMetric_IP, VecSimMetric_Cosine}) {
+        auto allocator = VecSimAllocator::newVecsimAllocator();
+        auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, 4, dim, 7, true);
+        void *zero_blob = nullptr;
+        void *vector_blob = nullptr;
+        void *query_blob = nullptr;
+        size_t zero_size = dim * sizeof(float);
+        size_t vector_size = dim * sizeof(float);
+        size_t query_size = dim * sizeof(float);
+        float full_query_score;
+        float coarse_query_score;
+        float zero_distance;
+        if (metric == VecSimMetric_IP) {
+            TQFlatDetails::TQPreprocessor<VecSimMetric_IP> preprocessor(allocator, state);
+            preprocessor.preprocessForStorage(zero.data(), zero_blob, zero_size, 0);
+            preprocessor.preprocessForStorage(vector.data(), vector_blob, vector_size, 0);
+            preprocessor.preprocessQuery(query.data(), query_blob, query_size, 0);
+            TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> full(allocator, state);
+            TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> coarse(
+                allocator, state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+            zero_distance = coarse.calcDistance(zero_blob, vector_blob, dim);
+            full_query_score = full.calcDistanceForQuery(vector_blob, query_blob, dim);
+            coarse_query_score = coarse.calcDistanceForQuery(vector_blob, query_blob, dim);
+        } else {
+            TQFlatDetails::TQPreprocessor<VecSimMetric_Cosine> preprocessor(allocator, state);
+            preprocessor.preprocessForStorage(zero.data(), zero_blob, zero_size, 0);
+            preprocessor.preprocessForStorage(vector.data(), vector_blob, vector_size, 0);
+            preprocessor.preprocessQuery(query.data(), query_blob, query_size, 0);
+            TQFlatDetails::TQDistanceCalculator<VecSimMetric_Cosine> full(allocator, state);
+            TQFlatDetails::TQDistanceCalculator<VecSimMetric_Cosine> coarse(
+                allocator, state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+            zero_distance = coarse.calcDistance(zero_blob, vector_blob, dim);
+            full_query_score = full.calcDistanceForQuery(vector_blob, query_blob, dim);
+            coarse_query_score = coarse.calcDistanceForQuery(vector_blob, query_blob, dim);
+        }
+        EXPECT_FLOAT_EQ(zero_distance, 1.0f);
+        EXPECT_FLOAT_EQ(coarse_query_score, full_query_score);
+        allocator->free_allocation(zero_blob);
+        allocator->free_allocation(vector_blob);
+        allocator->free_allocation(query_blob);
+    }
+}
+
+TEST(TQCoarseMseTest, repeated_stored_scoring_performs_no_vecsim_allocations) {
+    constexpr size_t dim = 31;
+    const std::vector<float> lhs(dim, 0.25f);
+    const std::vector<float> rhs(dim, -0.4f);
+    EncodedPair<VecSimMetric_IP> lhs_encoded(dim, 8, 9, true, lhs.data(), rhs.data());
+    EncodedPair<VecSimMetric_IP> rhs_encoded(dim, 8, 9, true, rhs.data(), lhs.data());
+    TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> calculator(
+        lhs_encoded.allocator, lhs_encoded.state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+    calculator.calcDistance(lhs_encoded.storage, rhs_encoded.storage, dim);
+
+    const uint64_t allocation_count = lhs_encoded.allocator->getAllocationCount();
+    const uint64_t allocation_size = lhs_encoded.allocator->getAllocationSize();
+    float checksum = 0.0f;
+    for (size_t i = 0; i < 10000; ++i) {
+        checksum += calculator.calcDistance(lhs_encoded.storage, rhs_encoded.storage, dim);
+    }
+    const uint64_t allocation_count_after = lhs_encoded.allocator->getAllocationCount();
+    const uint64_t allocation_size_after = lhs_encoded.allocator->getAllocationSize();
+    EXPECT_TRUE(std::isfinite(checksum));
+    EXPECT_EQ(allocation_count_after, allocation_count);
+    EXPECT_EQ(allocation_size_after, allocation_size);
+}
+
+TEST(TQCoarseMseTest, hnsw_single_and_multi_exercise_diversification_replacement_and_repair) {
+    constexpr size_t dim = 8;
+    for (bool multi : {false, true}) {
+        TQFlatDetails::ResetCoarseMseDiagnostics();
+        HNSWIndex<float, float> *index =
+            multi ? CreateInternalCoarseTQHNSW<VecSimMetric_IP, true>(dim, 4, 23)
+                  : CreateInternalCoarseTQHNSW<VecSimMetric_IP, false>(dim, 4, 23);
+        for (size_t label = 0; label < 64; ++label) {
+            std::array<float, dim> vector{};
+            for (size_t i = 0; i < dim; ++i) {
+                vector[i] = std::sin(static_cast<float>((label + 3) * (i + 5)) * 0.113f) +
+                            0.03f * static_cast<float>(i);
+            }
+            ASSERT_EQ(index->addVector(vector.data(), label), 1);
+            if (multi && label == 7) {
+                for (float &value : vector) {
+                    value *= -0.7f;
+                }
+                ASSERT_EQ(index->addVector(vector.data(), label), 1);
+            }
+        }
+        EXPECT_GT(TQFlatDetails::GetCoarseMseStoredDistanceCalls(), 0U);
+        EXPECT_TRUE(index->checkIntegrity().valid_state);
+
+        const size_t calls_before_update = TQFlatDetails::GetCoarseMseStoredDistanceCalls();
+        std::array<float, dim> replacement = {0.4f, -0.1f, 0.8f, -0.7f, 0.2f, 0.9f, -0.3f, 0.5f};
+        if (!multi) {
+            EXPECT_EQ(index->addVector(replacement.data(), 5), 0);
+        } else {
+            EXPECT_EQ(index->addVector(replacement.data(), 100), 1);
+        }
+        EXPECT_EQ(index->deleteVector(7), multi ? 2 : 1);
+        EXPECT_GT(TQFlatDetails::GetCoarseMseStoredDistanceCalls(), calls_before_update);
+        const auto integrity = index->checkIntegrity();
+        EXPECT_TRUE(integrity.valid_state);
+        EXPECT_EQ(integrity.connections_to_repair, 0U);
+        EXPECT_EQ(TQFlatDetails::GetZeroCoarseNormEvents(), 0U);
+        VecSimIndex_Free(index);
+    }
 }
 
 TEST(TQPaperConformanceTest, simd_matches_scalar_for_bit_widths_tails_and_unaligned_storage) {

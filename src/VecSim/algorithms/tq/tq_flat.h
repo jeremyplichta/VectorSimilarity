@@ -10,6 +10,7 @@
 
 #include "VecSim/algorithms/brute_force/brute_force_single.h"
 #include "VecSim/algorithms/tq/tq_model.h"
+#include "VecSim/algorithms/tq/tq_stored_distance.h"
 #include "VecSim/spaces/computer/calculator.h"
 #include "VecSim/spaces/computer/preprocessor_container.h"
 #include "VecSim/utils/vec_utils.h"
@@ -50,8 +51,8 @@ inline float NormalizeInPlace(float *values, size_t dim) {
 template <VecSimMetric Metric>
 class TQDistanceCalculator : public IndexCalculatorInterface<float> {
 private:
-    static float calcStoredWithContext(const void *opaque_state, const void *lhs_blob,
-                                       const void *rhs_blob, size_t dim) {
+    static float calcStoredFullDecodeWithContext(const void *opaque_state, const void *lhs_blob,
+                                                 const void *rhs_blob, size_t dim) {
         const auto *state = static_cast<const TQModelState *>(opaque_state);
         assert(dim == state->dim);
         std::vector<float> lhs(dim);
@@ -74,6 +75,37 @@ private:
         return 1.0f - DotProductScalar(lhs.data(), rhs.data(), dim);
     }
 
+    static float calcStoredCoarseMseWithContext(const void *opaque_state, const void *lhs_blob,
+                                                const void *rhs_blob, size_t dim) {
+        const auto *state = static_cast<const TQModelState *>(opaque_state);
+        assert(dim == state->dim);
+        const auto lhs = state->storageView(lhs_blob);
+        const auto rhs = state->storageView(rhs_blob);
+
+        // Both supported metrics define the distance to a zero source as one. Read alpha before
+        // touching the packed indices so the zero-vector behavior matches the reference path.
+        if (lhs.source_scale == 0.0f || rhs.source_scale == 0.0f) {
+            return 1.0f;
+        }
+
+        const auto accumulators = AccumulateCoarseMse(*state, lhs, rhs);
+        if constexpr (Metric == VecSimMetric_Cosine) {
+            if (accumulators.lhs_norm_sq == 0.0f || accumulators.rhs_norm_sq == 0.0f) {
+                RecordZeroCoarseNorm();
+                return 1.0f;
+            }
+            const float inverse_norm =
+                1.0f / std::sqrt(accumulators.lhs_norm_sq * accumulators.rhs_norm_sq);
+            return 1.0f - accumulators.dot * inverse_norm;
+        }
+        if constexpr (Metric == VecSimMetric_IP) {
+            return 1.0f - lhs.source_scale * rhs.source_scale * accumulators.dot;
+        }
+        // CoarseMse is an HNSW experiment for the publicly supported TQ IP/COSINE metrics only.
+        assert(false && "CoarseMse does not define an L2 stored distance");
+        return 0.0f;
+    }
+
     static float calcQueryWithContext(const void *opaque_state, const void *storage_blob,
                                       const void *query_blob, size_t dim) {
         const auto *state = static_cast<const TQModelState *>(opaque_state);
@@ -89,12 +121,22 @@ private:
     }
 
 public:
-    TQDistanceCalculator(std::shared_ptr<VecSimAllocator> allocator,
-                         std::shared_ptr<TQModelState> state)
-        : IndexCalculatorInterface<float>(allocator), state(std::move(state)) {}
+    TQDistanceCalculator(
+        std::shared_ptr<VecSimAllocator> allocator, std::shared_ptr<TQModelState> state,
+        TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference)
+        : IndexCalculatorInterface<float>(allocator), state(std::move(state)),
+          stored_distance_mode(stored_distance_mode) {
+        if constexpr (Metric == VecSimMetric_L2) {
+            if (stored_distance_mode == TQStoredDistanceMode::CoarseMse) {
+                throw std::invalid_argument("CoarseMse supports TQ IP and COSINE only");
+            }
+        }
+    }
 
     float calcDistance(const void *v1, const void *v2, size_t dim) const override {
-        return calcStoredWithContext(state.get(), v1, v2, dim);
+        return stored_distance_mode == TQStoredDistanceMode::CoarseMse
+                   ? calcStoredCoarseMseWithContext(state.get(), v1, v2, dim)
+                   : calcStoredFullDecodeWithContext(state.get(), v1, v2, dim);
     }
 
     float calcDistanceForQuery(const void *candidate_vector, const void *query_vector,
@@ -103,13 +145,22 @@ public:
     }
 
     DistanceDispatch<float> getDistanceDispatch(DistanceMode mode) const override {
-        return mode == DistanceMode::StoredToStored
-                   ? DistanceDispatch<float>::stateful(state.get(), calcStoredWithContext)
-                   : DistanceDispatch<float>::stateful(state.get(), calcQueryWithContext);
+        if (mode == DistanceMode::StoredToQuery) {
+            return DistanceDispatch<float>::stateful(state.get(), calcQueryWithContext);
+        }
+        // HNSW snapshots this callback during construction, so the hot stored-to-stored path does
+        // not branch on the experimental construction mode.
+        return stored_distance_mode == TQStoredDistanceMode::CoarseMse
+                   ? DistanceDispatch<float>::stateful(state.get(), calcStoredCoarseMseWithContext)
+                   : DistanceDispatch<float>::stateful(state.get(),
+                                                       calcStoredFullDecodeWithContext);
     }
+
+    TQStoredDistanceMode getStoredDistanceMode() const { return stored_distance_mode; }
 
 private:
     std::shared_ptr<TQModelState> state;
+    TQStoredDistanceMode stored_distance_mode;
 };
 
 template <VecSimMetric Metric>
@@ -223,11 +274,13 @@ inline size_t GetStorageDataSize(const TQFlatParams *params) {
 }
 
 template <VecSimMetric Metric>
-inline IndexComponents<float, float> CreateTQComponents(std::shared_ptr<VecSimAllocator> allocator,
-                                                        const TQFlatParams *params) {
+inline IndexComponents<float, float> CreateTQComponents(
+    std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params,
+    TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference) {
     auto state = std::make_shared<TQModelState>(params->dim, params->bits, params->projections,
                                                 params->seed, params->useRotation);
-    auto *index_calculator = new (allocator) TQDistanceCalculator<Metric>(allocator, state);
+    auto *index_calculator =
+        new (allocator) TQDistanceCalculator<Metric>(allocator, state, stored_distance_mode);
     auto *preprocessors =
         new (allocator) MultiPreprocessorsContainer<float, 1>(allocator, alignof(float));
     auto *tq_preprocessor = new (allocator) TQPreprocessor<Metric>(allocator, state);
@@ -240,7 +293,15 @@ inline IndexComponents<float, float> CreateTQComponents(std::shared_ptr<VecSimAl
 template <VecSimMetric Metric>
 inline IndexComponents<float, float>
 CreateTQHNSWComponents(std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params) {
-    return CreateTQComponents<Metric>(std::move(allocator), params);
+    return CreateTQComponents<Metric>(std::move(allocator), params,
+                                      TQStoredDistanceMode::FullDecodeReference);
+}
+
+template <VecSimMetric Metric>
+inline IndexComponents<float, float>
+CreateTQHNSWComponents(std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params,
+                       TQStoredDistanceMode stored_distance_mode) {
+    return CreateTQComponents<Metric>(std::move(allocator), params, stored_distance_mode);
 }
 
 class TQFlatIndex : public BruteForceIndex_Single<float, float> {

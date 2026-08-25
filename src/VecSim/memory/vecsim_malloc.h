@@ -22,6 +22,9 @@ struct VecSimAllocator {
 
 private:
     std::atomic_uint64_t allocated;
+#ifdef BUILD_TESTS
+    std::atomic_uint64_t allocation_count;
+#endif
 
     // Static member that indicates each allocation additional size.
     static size_t allocation_header_size;
@@ -29,7 +32,12 @@ private:
 
     // Forward declaration of the deleter for the unique_ptr.
     struct Deleter;
+#ifdef BUILD_TESTS
+    VecSimAllocator()
+        : allocated(std::atomic_uint64_t(sizeof(VecSimAllocator))), allocation_count(0) {}
+#else
     VecSimAllocator() : allocated(std::atomic_uint64_t(sizeof(VecSimAllocator))) {}
+#endif
 
 public:
     static std::shared_ptr<VecSimAllocator> newVecsimAllocator();
@@ -50,6 +58,9 @@ public:
     void operator delete[](void *p, size_t size);
 
     uint64_t getAllocationSize() const;
+#ifdef BUILD_TESTS
+    uint64_t getAllocationCount() const;
+#endif
     inline friend bool operator==(const VecSimAllocator &a, const VecSimAllocator &b) {
         return a.allocated == b.allocated;
     }
