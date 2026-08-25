@@ -23,7 +23,6 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <vector>
 
 namespace TQFlatDetails {
 
@@ -48,6 +47,16 @@ inline float NormalizeInPlace(float *values, size_t dim) {
     return norm;
 }
 
+inline MemoryUtils::unique_blob AllocateTQScratch(const TQModelState &state, size_t float_count) {
+    const size_t bytes =
+        CheckedBytes(float_count, sizeof(float), "TurboQuant operation scratch size overflow");
+    auto scratch = state.getAllocator()->allocate_unique(bytes);
+    if (!scratch) {
+        throw std::bad_alloc();
+    }
+    return scratch;
+}
+
 template <VecSimMetric Metric>
 class TQDistanceCalculator : public IndexCalculatorInterface<float> {
 private:
@@ -55,14 +64,21 @@ private:
                                                  const void *rhs_blob, size_t dim) {
         const auto *state = static_cast<const TQModelState *>(opaque_state);
         assert(dim == state->dim);
-        std::vector<float> lhs(dim);
-        std::vector<float> rhs(dim);
-        state->decode(state->storageView(lhs_blob), lhs.data());
-        state->decode(state->storageView(rhs_blob), rhs.data());
+        auto scratch = AllocateTQScratch(
+            *state, CheckedMultiply(dim, size_t{6}, "TurboQuant decode scratch overflow"));
+        auto *words = static_cast<float *>(scratch.get());
+        float *lhs = words;
+        float *rhs = lhs + dim;
+        float *lhs_rotated = rhs + dim;
+        float *lhs_transform_scratch = lhs_rotated + dim;
+        float *rhs_rotated = lhs_transform_scratch + dim;
+        float *rhs_transform_scratch = rhs_rotated + dim;
+        state->decode(state->storageView(lhs_blob), lhs, lhs_rotated, lhs_transform_scratch);
+        state->decode(state->storageView(rhs_blob), rhs, rhs_rotated, rhs_transform_scratch);
 
         if constexpr (Metric == VecSimMetric_Cosine) {
-            NormalizeInPlace(lhs.data(), dim);
-            NormalizeInPlace(rhs.data(), dim);
+            NormalizeInPlace(lhs, dim);
+            NormalizeInPlace(rhs, dim);
         }
         if constexpr (Metric == VecSimMetric_L2) {
             float distance = 0.0f;
@@ -72,7 +88,7 @@ private:
             }
             return distance;
         }
-        return 1.0f - DotProductScalar(lhs.data(), rhs.data(), dim);
+        return 1.0f - DotProductScalar(lhs, rhs, dim);
     }
 
     static float calcStoredCoarseMseWithContext(const void *opaque_state, const void *lhs_blob,
@@ -122,7 +138,7 @@ private:
 
 public:
     TQDistanceCalculator(
-        std::shared_ptr<VecSimAllocator> allocator, std::shared_ptr<TQModelState> state,
+        std::shared_ptr<VecSimAllocator> allocator, std::shared_ptr<const TQModelState> state,
         TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference)
         : IndexCalculatorInterface<float>(allocator), state(std::move(state)),
           stored_distance_mode(stored_distance_mode) {
@@ -159,35 +175,63 @@ public:
     TQStoredDistanceMode getStoredDistanceMode() const { return stored_distance_mode; }
 
 private:
-    std::shared_ptr<TQModelState> state;
+    std::shared_ptr<const TQModelState> state;
     TQStoredDistanceMode stored_distance_mode;
 };
 
 template <VecSimMetric Metric>
 class TQPreprocessor : public PreprocessorInterface {
 public:
-    TQPreprocessor(std::shared_ptr<VecSimAllocator> allocator, std::shared_ptr<TQModelState> state)
+    TQPreprocessor(std::shared_ptr<VecSimAllocator> allocator,
+                   std::shared_ptr<const TQModelState> state)
         : PreprocessorInterface(allocator), state(std::move(state)) {}
 
     void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
                     size_t &storage_blob_size, size_t &query_blob_size,
                     unsigned char storage_alignment, unsigned char query_alignment) const override {
+        const bool owns_storage_on_success = storage_blob == nullptr;
+        const bool owns_query_on_success = query_blob == nullptr;
         preprocessForStorage(original_blob, storage_blob, storage_blob_size, storage_alignment);
-        preprocessQuery(original_blob, query_blob, query_blob_size, query_alignment);
+        try {
+            preprocessQuery(original_blob, query_blob, query_blob_size, query_alignment);
+        } catch (...) {
+            if (owns_storage_on_success) {
+                this->allocator->free_allocation(storage_blob);
+                storage_blob = nullptr;
+            }
+            if (owns_query_on_success && query_blob) {
+                this->allocator->free_allocation(query_blob);
+                query_blob = nullptr;
+            }
+            throw;
+        }
     }
 
     void preprocessForStorage(const void *original_blob, void *&storage_blob,
                               size_t &input_blob_size,
                               unsigned char storage_alignment) const override {
+        auto scratch =
+            AllocateTQScratch(*state, CheckedMultiply(state->dim, size_t{6},
+                                                      "TurboQuant storage scratch size overflow"));
         if (!storage_blob) {
             storage_blob =
                 this->allocator->allocate_aligned(state->storageBlobSize(), storage_alignment);
+            if (!storage_blob) {
+                throw std::bad_alloc();
+            }
         }
         std::memset(storage_blob, 0, state->storageBlobSize());
 
         const auto *input = static_cast<const float *>(original_blob);
-        std::vector<float> unit(input, input + state->dim);
-        const float original_norm = NormalizeInPlace(unit.data(), state->dim);
+        auto *words = static_cast<float *>(scratch.get());
+        float *unit = words;
+        float *reconstructed = unit + state->dim;
+        float *residual = reconstructed + state->dim;
+        float *rotated = residual + state->dim;
+        float *reconstructed_rotated = rotated + state->dim;
+        float *transform_scratch = reconstructed_rotated + state->dim;
+        std::copy(input, input + state->dim, unit);
+        const float original_norm = NormalizeInPlace(unit, state->dim);
         if (original_norm == 0.0f) {
             state->writeMetadata(storage_blob, 0.0f, 0.0f);
             input_blob_size = state->storageBlobSize();
@@ -196,24 +240,23 @@ public:
 
         auto *indices = static_cast<uint8_t *>(storage_blob);
         auto *signs = indices + state->packedIndexBytes();
-        std::vector<float> reconstructed(state->dim);
-        std::vector<float> residual(state->dim);
-        state->encodeMse(unit.data(), indices, reconstructed.data());
+        state->encodeMse(unit, indices, reconstructed, rotated, reconstructed_rotated,
+                         transform_scratch);
         for (size_t i = 0; i < state->dim; ++i) {
             residual[i] = unit[i] - reconstructed[i];
         }
 
-        const float residual_norm = std::sqrt(SumSquaresScalar(residual.data(), state->dim));
+        const float residual_norm = std::sqrt(SumSquaresScalar(residual, state->dim));
         if (residual_norm > 0.0f) {
             const float inverse_residual_norm = 1.0f / residual_norm;
-            for (float &value : residual) {
-                value *= inverse_residual_norm;
+            for (size_t i = 0; i < state->dim; ++i) {
+                residual[i] *= inverse_residual_norm;
             }
-            state->packResidualSigns(residual.data(), signs);
+            state->packResidualSigns(residual, signs, rotated, transform_scratch);
         } else {
             // sign(0) is +1. The signs are ignored because gamma is zero, but keeping the
             // canonical mathematical value makes byte-level tests unambiguous.
-            state->packResidualSigns(residual.data(), signs);
+            state->packResidualSigns(residual, signs, rotated, transform_scratch);
         }
 
         const float source_scale = Metric == VecSimMetric_Cosine ? 1.0f : original_norm;
@@ -226,68 +269,80 @@ public:
 #ifdef BUILD_TESTS
         query_preprocessing_count.fetch_add(1);
 #endif
+        auto scratch =
+            AllocateTQScratch(*state, CheckedMultiply(state->dim, size_t{2},
+                                                      "TurboQuant query scratch size overflow"));
         if (!query_blob) {
             query_blob = this->allocator->allocate_aligned(state->queryBlobSize(), alignment);
+            if (!query_blob) {
+                throw std::bad_alloc();
+            }
         }
 
         const auto *input = static_cast<const float *>(original_blob);
-        std::vector<float> query(input, input + state->dim);
+        auto *query = static_cast<float *>(scratch.get());
+        auto *backend_scratch = query + state->dim;
+        std::copy(input, input + state->dim, query);
         if constexpr (Metric == VecSimMetric_Cosine) {
-            NormalizeInPlace(query.data(), state->dim);
+            NormalizeInPlace(query, state->dim);
         }
 
         auto *words = static_cast<float *>(query_blob);
         auto *rotated = words;
         auto *projected = rotated + state->dim;
         auto *norm_sq = projected + state->projections;
-        state->applyRotation(query.data(), rotated);
-        state->projectQjl(query.data(), projected);
-        *norm_sq = SumSquaresScalar(query.data(), state->dim);
+        state->applyRotation(query, rotated, backend_scratch);
+        state->projectQjl(query, projected, backend_scratch);
+        *norm_sq = SumSquaresScalar(query, state->dim);
         input_blob_size = state->queryBlobSize();
     }
 
     void preprocessStorageInPlace(void *original_blob, size_t input_blob_size) const override {
         assert(original_blob);
         assert(input_blob_size >= state->storageBlobSize());
-        std::vector<uint8_t> encoded(state->storageBlobSize());
-        void *encoded_blob = encoded.data();
+        auto encoded = this->allocator->allocate_unique(state->storageBlobSize());
+        if (!encoded) {
+            throw std::bad_alloc();
+        }
+        void *encoded_blob = encoded.get();
         size_t encoded_size = input_blob_size;
         preprocessForStorage(original_blob, encoded_blob, encoded_size, 0);
-        std::memcpy(original_blob, encoded.data(), state->storageBlobSize());
+        std::memcpy(original_blob, encoded.get(), state->storageBlobSize());
     }
 
 private:
-    std::shared_ptr<TQModelState> state;
+    std::shared_ptr<const TQModelState> state;
 };
 
 template <VecSimMetric Metric>
 inline size_t GetStorageDataSize(const TQFlatParams *params) {
-    MseBits(params->bits);
-    if (params->dim < 2) {
-        throw std::invalid_argument("TurboQuant requires dimension >= 2");
-    }
-    if (params->projections != params->dim) {
-        throw std::invalid_argument("Paper-faithful TurboQuant requires projections == dim");
-    }
-    return PackedBytes(params->dim, params->bits - 1) + PackedBytes(params->dim, 1) +
-           2 * sizeof(float);
+    ValidateTQCodecConfig(TQCodecConfig::DenseReference(
+        params->dim, params->bits, params->projections, params->seed, params->useRotation));
+    return CheckedAdd(CheckedAdd(PackedBytes(params->dim, params->bits - 1),
+                                 PackedBytes(params->dim, 1),
+                                 "TurboQuant payload byte size overflow"),
+                      2 * sizeof(float), "TurboQuant payload byte size overflow");
 }
 
 template <VecSimMetric Metric>
 inline IndexComponents<float, float> CreateTQComponents(
     std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params,
     TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference) {
-    auto state = std::make_shared<TQModelState>(params->dim, params->bits, params->projections,
-                                                params->seed, params->useRotation);
-    auto *index_calculator =
-        new (allocator) TQDistanceCalculator<Metric>(allocator, state, stored_distance_mode);
-    auto *preprocessors =
-        new (allocator) MultiPreprocessorsContainer<float, 1>(allocator, alignof(float));
-    auto *tq_preprocessor = new (allocator) TQPreprocessor<Metric>(allocator, state);
-    const int rc = preprocessors->addPreprocessor(tq_preprocessor);
-    UNUSED(rc);
-    assert(rc != -1 && "TQ preprocessor was not added correctly");
-    return {index_calculator, preprocessors};
+    auto state =
+        AllocateDenseReferenceTQModelState(allocator, params->dim, params->bits,
+                                           params->projections, params->seed, params->useRotation);
+    auto index_calculator = std::unique_ptr<TQDistanceCalculator<Metric>>(
+        new (allocator) TQDistanceCalculator<Metric>(allocator, state, stored_distance_mode));
+    auto preprocessors = std::unique_ptr<MultiPreprocessorsContainer<float, 1>>(
+        new (allocator) MultiPreprocessorsContainer<float, 1>(allocator, alignof(float)));
+    auto tq_preprocessor = std::unique_ptr<TQPreprocessor<Metric>>(
+        new (allocator) TQPreprocessor<Metric>(allocator, state));
+    const int rc = preprocessors->addPreprocessor(tq_preprocessor.get());
+    if (rc == -1) {
+        throw std::runtime_error("TQ preprocessor registration failed");
+    }
+    tq_preprocessor.release();
+    return {index_calculator.release(), preprocessors.release()};
 }
 
 template <VecSimMetric Metric>

@@ -12,18 +12,23 @@
 #include "VecSim/algorithms/hnsw/hnsw_serializer.h"
 #include "VecSim/algorithms/tq/tq_flat.h"
 #include "VecSim/algorithms/tq/tq_hnsw.h"
+#include "VecSim/index_factories/hnsw_factory.h"
+#include "VecSim/index_factories/tq_factory.h"
 #include "VecSim/vec_sim.h"
 #include "tq_paper_reference.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -165,7 +170,7 @@ HNSWIndex<float, float> *CreateInternalCoarseTQHNSW(size_t dim, size_t bits, siz
 template <VecSimMetric Metric>
 struct EncodedPair {
     std::shared_ptr<VecSimAllocator> allocator;
-    std::shared_ptr<TQFlatDetails::TQModelState> state;
+    std::shared_ptr<const TQFlatDetails::TQModelState> state;
     TQFlatDetails::TQPreprocessor<Metric> preprocessor;
     void *storage{nullptr};
     void *query{nullptr};
@@ -173,7 +178,8 @@ struct EncodedPair {
     EncodedPair(size_t dim, size_t bits, size_t seed, bool use_rotation, const float *vector,
                 const float *query_vector)
         : allocator(VecSimAllocator::newVecsimAllocator()),
-          state(std::make_shared<TQFlatDetails::TQModelState>(dim, bits, dim, seed, use_rotation)),
+          state(TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, bits, dim, seed,
+                                                                  use_rotation)),
           preprocessor(allocator, state) {
         size_t storage_size = dim * sizeof(float);
         preprocessor.preprocessForStorage(vector, storage, storage_size, 0);
@@ -352,7 +358,8 @@ TEST(TQPaperConformanceTest, stored_to_stored_distance_matches_explicit_algorith
     const std::array<float, dim> lhs = {1.0f, 0.2f, -0.3f, 0.4f, 0.1f, -0.2f, 0.6f, 0.7f};
     const std::array<float, dim> rhs = {-0.4f, 0.3f, 0.2f, 0.1f, 0.9f, -0.8f, 0.5f, 0.2f};
     auto allocator = VecSimAllocator::newVecsimAllocator();
-    auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, 4, dim, 23, true);
+    auto state =
+        TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, 4, dim, 23, true);
     TQFlatDetails::TQPreprocessor<VecSimMetric_IP> preprocessor(allocator, state);
     TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> calculator(allocator, state);
     EXPECT_EQ(calculator.getStoredDistanceMode(),
@@ -397,8 +404,9 @@ TEST(TQCoarseMseTest, packed_kernel_matches_independent_explicit_algorithm_one_d
                 rhs[i] = 0.6f * std::cos(static_cast<float>((i + 3) * 11) * 0.097f);
             }
 
-            auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, bits, dim, seed, true);
             auto allocator = VecSimAllocator::newVecsimAllocator();
+            auto state = TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, bits,
+                                                                           dim, seed, true);
             for (auto [reference_metric, vecsim_metric] :
                  {std::pair{tq_paper_reference::Metric::InnerProduct, VecSimMetric_IP},
                   std::pair{tq_paper_reference::Metric::Cosine, VecSimMetric_Cosine}}) {
@@ -407,9 +415,8 @@ TEST(TQCoarseMseTest, packed_kernel_matches_independent_explicit_algorithm_one_d
                 std::vector<uint8_t> unaligned_rhs(rhs_encoded.bytes.size() + 1);
                 std::memcpy(unaligned_rhs.data() + 1, rhs_encoded.bytes.data(),
                             rhs_encoded.bytes.size());
-                const double expected =
-                    ReferenceCoarseDistance(reference, lhs_encoded, rhs_encoded, reference_metric,
-                                            state->centroids);
+                const double expected = ReferenceCoarseDistance(reference, lhs_encoded, rhs_encoded,
+                                                                reference_metric, state->centroids);
 
                 float actual;
                 if (vecsim_metric == VecSimMetric_IP) {
@@ -433,7 +440,9 @@ TEST(TQCoarseMseTest, production_dimension_tail_matches_double_accumulation) {
     constexpr size_t dim = 1024;
     for (size_t bits : {size_t{2}, size_t{4}, size_t{8}}) {
         SCOPED_TRACE(::testing::Message() << "bits=" << bits);
-        auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, bits, dim, 31, false);
+        auto allocator = VecSimAllocator::newVecsimAllocator();
+        auto state =
+            TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, bits, dim, 31, false);
         std::vector<uint8_t> lhs(state->storageBlobSize(), 0);
         std::vector<uint8_t> rhs_unaligned(state->storageBlobSize() + 1, 0);
         auto *rhs = rhs_unaligned.data() + 1;
@@ -458,7 +467,6 @@ TEST(TQCoarseMseTest, production_dimension_tail_matches_double_accumulation) {
             rhs_norm_sq += rhs_centroid * rhs_centroid;
         }
 
-        auto allocator = VecSimAllocator::newVecsimAllocator();
         TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> ip_calculator(
             allocator, state, TQFlatDetails::TQStoredDistanceMode::CoarseMse);
         TQFlatDetails::TQDistanceCalculator<VecSimMetric_Cosine> cosine_calculator(
@@ -477,7 +485,8 @@ TEST(TQCoarseMseTest, zero_sources_and_query_scoring_preserve_existing_semantics
     const std::array<float, dim> query = {-0.1f, 0.6f, 0.2f, -0.7f, 0.9f, 0.3f, -0.4f, 0.5f};
     for (VecSimMetric metric : {VecSimMetric_IP, VecSimMetric_Cosine}) {
         auto allocator = VecSimAllocator::newVecsimAllocator();
-        auto state = std::make_shared<TQFlatDetails::TQModelState>(dim, 4, dim, 7, true);
+        auto state =
+            TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, 4, dim, 7, true);
         void *zero_blob = nullptr;
         void *vector_blob = nullptr;
         void *query_blob = nullptr;
@@ -761,6 +770,204 @@ TEST(TQHNSWDistanceTest, multi_value_raw_query_uses_minimum_approximate_score) {
     ASSERT_NE(context, nullptr);
     EXPECT_NEAR(VecSimIndex_AdhocBfCtx_GetDistanceFrom(context, 7), result->second, 1e-6);
     VecSimIndex_AdhocBfCtx_Free(context);
+}
+
+TEST(TQModelVersionTest, dense_identity_is_explicit_deterministic_and_seed_sensitive) {
+    auto allocator = VecSimAllocator::newVecsimAllocator();
+    auto first = TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, 8, 4, 8, 17, true);
+    auto second = TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, 8, 4, 8, 17, true);
+    auto changed_seed =
+        TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, 8, 4, 8, 31, true);
+
+    EXPECT_EQ(first->modelIdentity(), second->modelIdentity());
+    EXPECT_FALSE(first->modelIdentity() == changed_seed->modelIdentity());
+    EXPECT_EQ(first->payloadLayoutVersion(), TQFlatDetails::TQPayloadLayoutVersion::PaperV1);
+    EXPECT_EQ(first->modelTransformVersion(),
+              TQFlatDetails::TQModelTransformVersion::DenseReferenceV1);
+    EXPECT_EQ(first->config.rotation_backend_version,
+              TQFlatDetails::TQRotationBackendVersion::DenseHaarV1);
+    EXPECT_EQ(first->config.qjl_backend_version,
+              TQFlatDetails::TQQjlBackendVersion::DenseGaussianV1);
+    EXPECT_EQ(
+        static_cast<uint8_t>(TQFlatDetails::TQModelTransformVersion::FastStructuredRotationV1), 2);
+    EXPECT_EQ(static_cast<uint8_t>(TQFlatDetails::TQModelTransformVersion::FastStructuredV1), 3);
+    EXPECT_EQ(TQFlatDetails::kTQConstructionScoreVersion, 1);
+}
+
+TEST(TQModelVersionTest, unsupported_component_and_profile_versions_fail_without_leaking) {
+    auto allocator = VecSimAllocator::newVecsimAllocator();
+    const uint64_t baseline = allocator->getAllocationSize();
+    auto config = TQFlatDetails::TQCodecConfig::DenseReference(8, 4, 8, 17);
+
+    config.payload_layout_version = static_cast<TQFlatDetails::TQPayloadLayoutVersion>(255);
+    EXPECT_THROW(TQFlatDetails::AllocateTQModelState(allocator, config), std::invalid_argument);
+    EXPECT_EQ(allocator->getAllocationSize(), baseline);
+
+    config = TQFlatDetails::TQCodecConfig::DenseReference(8, 4, 8, 17);
+    config.model_transform_version =
+        TQFlatDetails::TQModelTransformVersion::FastStructuredRotationV1;
+    config.rotation_backend_version = TQFlatDetails::TQRotationBackendVersion::FastStructuredV1;
+    EXPECT_THROW(TQFlatDetails::AllocateTQModelState(allocator, config), std::invalid_argument);
+    EXPECT_EQ(allocator->getAllocationSize(), baseline);
+
+    config = TQFlatDetails::TQCodecConfig::DenseReference(8, 4, 8, 17);
+    config.qjl_backend_version = static_cast<TQFlatDetails::TQQjlBackendVersion>(255);
+    EXPECT_THROW(TQFlatDetails::AllocateTQModelState(allocator, config), std::invalid_argument);
+    EXPECT_EQ(allocator->getAllocationSize(), baseline);
+}
+
+TEST(TQModelAllocationTest, persistent_dense_state_is_tracked_estimated_and_released) {
+    for (size_t dim : {size_t{8}, size_t{1024}, size_t{1536}, size_t{3072}}) {
+        SCOPED_TRACE(::testing::Message() << "dim=" << dim);
+        auto allocator = VecSimAllocator::newVecsimAllocator();
+        const uint64_t baseline = allocator->getAllocationSize();
+        // Identity rotation avoids cubic QR in this allocation-only test. It is test-only and
+        // allocates exactly the same persistent dense matrices as production DenseReferenceV1.
+        auto model =
+            TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, 4, dim, 17, false);
+        const size_t actual = allocator->getAllocationSize() - baseline;
+        const size_t estimate =
+            TQFlatDetails::EstimateDenseReferenceTQModelAllocationSize(dim, 4, dim, 17);
+        EXPECT_EQ(actual, estimate);
+        EXPECT_GT(actual, 3 * dim * dim * sizeof(float));
+        model.reset();
+        EXPECT_EQ(allocator->getAllocationSize(), baseline);
+    }
+}
+
+TEST(TQModelAllocationTest, empty_indexes_include_model_memory_and_release_it) {
+    for (VecSimAlgo algo : {VecSimAlgo_TQ, VecSimAlgo_TQ_HNSW}) {
+        auto params = algo == VecSimAlgo_TQ ? CreateTQParams(8, VecSimMetric_Cosine)
+                                            : CreateTQHNSWParams(8, VecSimMetric_Cosine);
+        std::unique_ptr<VecSimIndex, decltype(&VecSimIndex_Free)> index(VecSimIndex_New(&params),
+                                                                        VecSimIndex_Free);
+        ASSERT_NE(index, nullptr);
+        auto allocator = index->getAllocator();
+        const size_t actual = index->getAllocationSize();
+        const size_t estimate = VecSimIndex_EstimateInitialSize(&params);
+        const size_t bounded_implementation_difference =
+            4 * VecSimAllocator::getAllocationOverheadSize() + 4 * sizeof(void *);
+        EXPECT_GE(actual + bounded_implementation_difference, estimate);
+        EXPECT_LE(actual, estimate + bounded_implementation_difference);
+        EXPECT_GT(actual, 3 * 8 * 8 * sizeof(float));
+        index.reset();
+        EXPECT_EQ(allocator->getAllocationSize(), sizeof(VecSimAllocator));
+    }
+}
+
+TEST(TQModelThreadSafetyTest, shared_model_supports_concurrent_encode_preprocess_and_score) {
+    constexpr size_t dim = 31;
+    auto allocator = VecSimAllocator::newVecsimAllocator();
+    auto model =
+        TQFlatDetails::AllocateDenseReferenceTQModelState(allocator, dim, 4, dim, 17, true);
+    TQFlatDetails::TQPreprocessor<VecSimMetric_IP> preprocessor(allocator, model);
+    TQFlatDetails::TQDistanceCalculator<VecSimMetric_IP> calculator(allocator, model);
+    std::array<float, dim> source{};
+    std::array<float, dim> query{};
+    for (size_t i = 0; i < dim; ++i) {
+        source[i] = std::sin(static_cast<float>(i + 1) * 0.31f);
+        query[i] = std::cos(static_cast<float>(i + 3) * 0.17f);
+    }
+
+    std::atomic_bool all_scores_finite{true};
+    std::vector<std::thread> workers;
+    for (size_t thread = 0; thread < 8; ++thread) {
+        workers.emplace_back([&]() {
+            for (size_t iteration = 0; iteration < 64; ++iteration) {
+                void *storage = nullptr;
+                void *processed_query = nullptr;
+                size_t storage_size = dim * sizeof(float);
+                size_t query_size = dim * sizeof(float);
+                preprocessor.preprocessForStorage(source.data(), storage, storage_size, 0);
+                preprocessor.preprocessQuery(query.data(), processed_query, query_size, 0);
+                const float score = calculator.calcDistanceForQuery(storage, processed_query, dim);
+                if (!std::isfinite(score)) {
+                    all_scores_finite.store(false);
+                }
+                allocator->free_allocation(storage);
+                allocator->free_allocation(processed_query);
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+    EXPECT_TRUE(all_scores_finite.load());
+}
+
+TEST(TQFactoryValidationTest, flat_creation_and_both_estimators_reject_the_same_parameters) {
+    auto valid = CreateTQParams(8, VecSimMetric_Cosine);
+    const auto expect_rejected = [](const VecSimParams &params) {
+        EXPECT_EQ(VecSimIndex_New(&params), nullptr);
+        EXPECT_THROW(TQFactory::EstimateInitialSize(&params.algoParams.tqFlatParams),
+                     std::invalid_argument);
+        EXPECT_THROW(TQFactory::EstimateElementSize(&params.algoParams.tqFlatParams),
+                     std::invalid_argument);
+    };
+
+    auto invalid = valid;
+    invalid.algoParams.tqFlatParams.type = VecSimType_FLOAT64;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqFlatParams.metric = VecSimMetric_L2;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqFlatParams.dim = 1;
+    invalid.algoParams.tqFlatParams.projections = 1;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqFlatParams.projections = 4;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqFlatParams.bits = 3;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqFlatParams.useRotation = false;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqFlatParams.multi = true;
+    expect_rejected(invalid);
+}
+
+TEST(TQFactoryValidationTest, hnsw_creation_and_both_estimators_reject_the_same_parameters) {
+    auto valid = CreateTQHNSWParams(8, VecSimMetric_IP);
+    const auto expect_rejected = [](const VecSimParams &params) {
+        EXPECT_EQ(VecSimIndex_New(&params), nullptr);
+        EXPECT_THROW(HNSWFactory::EstimateInitialSize(&params.algoParams.tqHnswParams),
+                     std::invalid_argument);
+        EXPECT_THROW(HNSWFactory::EstimateElementSize(&params.algoParams.tqHnswParams),
+                     std::invalid_argument);
+    };
+
+    auto invalid = valid;
+    invalid.algoParams.tqHnswParams.type = VecSimType_FLOAT64;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqHnswParams.metric = VecSimMetric_L2;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqHnswParams.dim = 1;
+    invalid.algoParams.tqHnswParams.projections = 1;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqHnswParams.projections = 4;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqHnswParams.bits = 6;
+    expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqHnswParams.useRotation = false;
+    expect_rejected(invalid);
+}
+
+TEST(TQFactoryValidationTest, checked_payload_matrix_and_capacity_arithmetic_rejects_overflow) {
+    EXPECT_THROW(TQFlatDetails::PackedBytes(std::numeric_limits<size_t>::max(), 7),
+                 std::overflow_error);
+    EXPECT_THROW(TQFlatDetails::EstimateDenseReferenceTQModelAllocationSize(
+                     std::numeric_limits<size_t>::max(), 8, std::numeric_limits<size_t>::max()),
+                 std::overflow_error);
+    EXPECT_THROW(TQFlatDetails::CheckedRoundUpCapacity(std::numeric_limits<size_t>::max() - 1, 4),
+                 std::overflow_error);
 }
 
 TEST(TQFlatTest, rejects_non_paper_parameters) {

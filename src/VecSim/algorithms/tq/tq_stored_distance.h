@@ -19,12 +19,15 @@ namespace TQFlatDetails {
 // This internal version identifies the meaning of the stored-distance choices below. It is
 // deliberately separate from the public payload/model version: changing HNSW construction
 // geometry does not change stored bytes or query scores.
-inline constexpr uint8_t kTQStoredDistanceModeVersion = 1;
+inline constexpr uint8_t kTQConstructionScoreVersion = 1;
+inline constexpr uint8_t kTQStoredDistanceModeVersion = kTQConstructionScoreVersion;
 
-enum class TQStoredDistanceMode : uint8_t {
+enum class TQConstructionScoreMode : uint8_t {
     FullDecodeReference = 1,
     CoarseMse = 2,
 };
+
+using TQStoredDistanceMode = TQConstructionScoreMode;
 
 struct TQCoarseMseAccumulators {
     float dot;

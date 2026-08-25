@@ -81,6 +81,14 @@ inline TQFlatParams AsTQFlatParams(const TQHNSWParams &params) {
     };
 }
 
+inline void ValidateTQParams(const TQHNSWParams &params) {
+    TQFlatDetails::ValidatePublicTQParams(AsTQFlatParams(params));
+}
+
+inline void AddTQEstimate(size_t &estimate, size_t bytes) {
+    estimate = TQFlatDetails::CheckedAdd(estimate, bytes, "TurboQuant HNSW size estimate overflow");
+}
+
 inline AbstractIndexInitParams NewTQAbstractInitParams(const TQHNSWParams *params, void *logCtx,
                                                        std::shared_ptr<VecSimAllocator> allocator,
                                                        size_t stored_data_size) {
@@ -93,7 +101,9 @@ inline AbstractIndexInitParams NewTQAbstractInitParams(const TQHNSWParams *param
             .multi = params->multi,
             .isDisk = false,
             .logCtx = logCtx,
-            .inputBlobSize = params->dim * VecSimType_sizeof(params->type)};
+            .inputBlobSize =
+                TQFlatDetails::CheckedBytes(params->dim, VecSimType_sizeof(params->type),
+                                            "TurboQuant input byte size overflow")};
 }
 
 template <VecSimMetric Metric>
@@ -113,13 +123,7 @@ VecSimIndex *NewTQIndexImpl(const VecSimParams *params) {
 VecSimIndex *NewIndex(const VecSimParams *params, bool is_normalized) {
     if (params->algo == VecSimAlgo_TQ_HNSW) {
         const auto &tq_params = params->algoParams.tqHnswParams;
-        if (tq_params.type != VecSimType_FLOAT32) {
-            throw std::invalid_argument("TQ-HNSW currently supports FLOAT32 input only");
-        }
-        if (tq_params.metric == VecSimMetric_L2) {
-            throw std::invalid_argument("TQ-HNSW currently rejects L2 until the TQ storage layout "
-                                        "has a persisted migration");
-        }
+        ValidateTQParams(tq_params);
         switch (tq_params.metric) {
         case VecSimMetric_IP:
             return NewTQIndexImpl<VecSimMetric_IP>(params);
@@ -246,32 +250,33 @@ size_t EstimateElementSize(const HNSWParams *params) {
 
 template <VecSimMetric Metric>
 size_t EstimateTQInitialSizeImpl(const TQHNSWParams *params) {
-    const size_t mse_bits = TQFlatDetails::MseBits(params->bits);
-    if (params->projections != params->dim) {
-        throw std::invalid_argument("Paper-faithful TurboQuant requires projections == dim");
-    }
     size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
-    size_t est = sizeof(VecSimAllocator) + allocations_overhead;
-    est += params->multi ? sizeof(TQHNSWDetails::TQHNSWIndex_Multi<float, float>)
-                         : sizeof(TQHNSWDetails::TQHNSWIndex_Single<float, float>);
-    est += allocations_overhead + sizeof(TQFlatDetails::TQDistanceCalculator<Metric>);
-    est += allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>);
-    est += allocations_overhead + sizeof(TQFlatDetails::TQPreprocessor<Metric>);
-    est += 2 * params->dim * params->dim * sizeof(float);
-    est += params->projections * params->dim * sizeof(float);
-    const size_t levels = size_t{1} << mse_bits;
-    est += (2 * levels - 1) * sizeof(float);
-    est += sizeof(DataBlocksContainer) + allocations_overhead;
-    est += sizeof(tag_t) * RoundUpInitialCapacity(params->initialCapacity, params->blockSize);
-    est += EstimateElementSize(params) *
-           RoundUpInitialCapacity(params->initialCapacity, params->blockSize);
+    size_t est = TQFlatDetails::CheckedAdd(sizeof(VecSimAllocator), allocations_overhead,
+                                           "TurboQuant HNSW size estimate overflow");
+    AddTQEstimate(est, params->multi ? sizeof(TQHNSWDetails::TQHNSWIndex_Multi<float, float>)
+                                     : sizeof(TQHNSWDetails::TQHNSWIndex_Single<float, float>));
+    AddTQEstimate(est, allocations_overhead + sizeof(TQFlatDetails::TQDistanceCalculator<Metric>));
+    AddTQEstimate(est, allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>));
+    AddTQEstimate(est, allocations_overhead + sizeof(TQFlatDetails::TQPreprocessor<Metric>));
+    AddTQEstimate(est, TQFlatDetails::EstimateDenseReferenceTQModelAllocationSize(
+                           params->dim, params->bits, params->projections, params->seed));
+    AddTQEstimate(est, sizeof(DataBlocksContainer) + allocations_overhead);
+    const size_t rounded_capacity =
+        TQFlatDetails::CheckedRoundUpCapacity(params->initialCapacity, params->blockSize);
+    AddTQEstimate(est,
+                  TQFlatDetails::CheckedBytes(rounded_capacity, sizeof(tag_t),
+                                              "TurboQuant HNSW label capacity estimate overflow"));
+    AddTQEstimate(
+        est, TQFlatDetails::CheckedMultiply(EstimateElementSize(params), rounded_capacity,
+                                            "TurboQuant HNSW element capacity estimate overflow"));
     return est;
 }
 
 size_t EstimateInitialSize(const TQHNSWParams *params) {
+    ValidateTQParams(*params);
     switch (params->metric) {
     case VecSimMetric_L2:
-        return EstimateTQInitialSizeImpl<VecSimMetric_L2>(params);
+        break;
     case VecSimMetric_IP:
         return EstimateTQInitialSizeImpl<VecSimMetric_IP>(params);
     case VecSimMetric_Cosine:
@@ -281,17 +286,24 @@ size_t EstimateInitialSize(const TQHNSWParams *params) {
 }
 
 size_t EstimateElementSize(const TQHNSWParams *params) {
+    ValidateTQParams(*params);
     HNSWParams hnsw_params = AsHNSWParams(*params);
     const auto tq_core_params = AsTQFlatParams(*params);
     size_t M = (hnsw_params.M) ? hnsw_params.M : HNSW_DEFAULT_M;
-    size_t elementGraphDataSize = sizeof(ElementGraphData) + sizeof(idType) * M * 2;
-    size_t size_total_data_per_element =
-        elementGraphDataSize +
-        TQFlatDetails::GetStorageDataSize<VecSimMetric_Cosine>(&tq_core_params);
+    size_t elementGraphDataSize = sizeof(ElementGraphData);
+    AddTQEstimate(
+        elementGraphDataSize,
+        TQFlatDetails::CheckedBytes(
+            TQFlatDetails::CheckedMultiply(M, size_t{2}, "TurboQuant HNSW degree overflow"),
+            sizeof(idType), "TurboQuant HNSW graph estimate overflow"));
+    size_t size_total_data_per_element = elementGraphDataSize;
+    AddTQEstimate(size_total_data_per_element,
+                  TQFlatDetails::GetStorageDataSize<VecSimMetric_Cosine>(&tq_core_params));
     size_t size_label_lookup_entry = sizeof(void *);
     size_t size_meta_data = sizeof(tag_t) + sizeof(ElementMetaData) +
                             sizeof(vecsim_stl::one_byte_mutex) + size_label_lookup_entry;
-    return size_meta_data + size_total_data_per_element;
+    AddTQEstimate(size_meta_data, size_total_data_per_element);
+    return size_meta_data;
 }
 
 #ifdef BUILD_TESTS
