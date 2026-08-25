@@ -47,6 +47,18 @@ inline float NormalizeInPlace(float *values, size_t dim) {
     return norm;
 }
 
+inline TQStoredDistanceMode TQStoredDistanceModeFromPublicParams(const TQFlatParams &params) {
+    switch (params.profile) {
+    case VecSimTqProfile_Default:
+    case VecSimTqProfile_DenseReferenceV1:
+        return TQStoredDistanceMode::FullDecodeReference;
+    case VecSimTqProfile_FastStructuredRotationV1:
+    case VecSimTqProfile_FastStructuredV1:
+        return TQStoredDistanceMode::CoarseMse;
+    }
+    throw std::invalid_argument("Unsupported TurboQuant model profile");
+}
+
 inline MemoryUtils::unique_blob AllocateTQScratch(const TQModelState &state, size_t float_count) {
     const size_t bytes =
         CheckedBytes(float_count, sizeof(float), "TurboQuant operation scratch size overflow");
@@ -381,8 +393,7 @@ private:
 
 template <VecSimMetric Metric>
 inline size_t GetStorageDataSize(const TQFlatParams *params) {
-    ValidateTQCodecConfig(TQCodecConfig::DenseReference(
-        params->dim, params->bits, params->projections, params->seed, params->useRotation));
+    ValidateTQCodecConfig(TQCodecConfigFromPublicParams(*params));
     return CheckedAdd(CheckedAdd(PackedBytes(params->dim, params->bits - 1),
                                  PackedBytes(params->dim, 1),
                                  "TurboQuant payload byte size overflow"),
@@ -426,9 +437,7 @@ template <VecSimMetric Metric>
 inline IndexComponents<float, float> CreateTQComponents(
     std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params,
     TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference) {
-    auto state =
-        AllocateDenseReferenceTQModelState(allocator, params->dim, params->bits,
-                                           params->projections, params->seed, params->useRotation);
+    auto state = AllocateTQModelState(allocator, TQCodecConfigFromPublicParams(*params));
     return CreateTQComponents<Metric>(std::move(allocator), std::move(state), stored_distance_mode);
 }
 

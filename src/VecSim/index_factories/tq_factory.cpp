@@ -69,8 +69,8 @@ size_t EstimateInitialSizeImpl(const TQFlatParams *params) {
     AddEstimate(est, allocations_overhead + sizeof(TQFlatDetails::TQDistanceCalculator<Metric>));
     AddEstimate(est, allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>));
     AddEstimate(est, allocations_overhead + sizeof(TQFlatDetails::TQPreprocessor<Metric>));
-    AddEstimate(est, TQFlatDetails::EstimateDenseReferenceTQModelAllocationSize(
-                         params->dim, params->bits, params->projections, params->seed));
+    AddEstimate(est, TQFlatDetails::EstimateTQModelAllocationSize(
+                         TQFlatDetails::TQCodecConfigFromPublicParams(*params)));
     return est;
 }
 

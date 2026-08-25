@@ -44,6 +44,12 @@ enum class TQModelTransformVersion : uint8_t {
     FastStructuredRotationV1 = 2,
     FastStructuredV1 = 3,
 };
+static_assert(static_cast<uint8_t>(TQModelTransformVersion::DenseReferenceV1) ==
+              static_cast<uint8_t>(VecSimTqProfile_DenseReferenceV1));
+static_assert(static_cast<uint8_t>(TQModelTransformVersion::FastStructuredRotationV1) ==
+              static_cast<uint8_t>(VecSimTqProfile_FastStructuredRotationV1));
+static_assert(static_cast<uint8_t>(TQModelTransformVersion::FastStructuredV1) ==
+              static_cast<uint8_t>(VecSimTqProfile_FastStructuredV1));
 enum class TQRotationBackendVersion : uint8_t {
     DenseHaarV1 = 1,
     FastStructuredV1 = 2,
@@ -191,6 +197,25 @@ struct TQCodecConfig {
     }
 };
 
+inline TQCodecConfig TQCodecConfigFromPublicParams(const TQFlatParams &params) {
+    if (!params.useRotation) {
+        throw std::invalid_argument("TurboQuant production configuration requires rotation");
+    }
+    switch (params.profile) {
+    case VecSimTqProfile_Default:
+    case VecSimTqProfile_DenseReferenceV1:
+        return TQCodecConfig::DenseReference(params.dim, params.bits, params.projections,
+                                             static_cast<uint64_t>(params.seed), true);
+    case VecSimTqProfile_FastStructuredRotationV1:
+        return TQCodecConfig::FastStructuredRotation(params.dim, params.bits, params.projections,
+                                                     static_cast<uint64_t>(params.seed));
+    case VecSimTqProfile_FastStructuredV1:
+        return TQCodecConfig::FastStructured(params.dim, params.bits, params.projections,
+                                             static_cast<uint64_t>(params.seed));
+    }
+    throw std::invalid_argument("Unsupported TurboQuant model profile");
+}
+
 struct TQModelIdentity {
     size_t dimension;
     size_t total_bits;
@@ -326,11 +351,7 @@ inline void ValidatePublicTQParams(const TQFlatParams &params) {
     if (params.metric != VecSimMetric_IP && params.metric != VecSimMetric_Cosine) {
         throw std::invalid_argument("Unsupported TurboQuant distance metric");
     }
-    if (!params.useRotation) {
-        throw std::invalid_argument("TurboQuant production configuration requires rotation");
-    }
-    ValidateTQCodecConfig(TQCodecConfig::DenseReference(params.dim, params.bits, params.projections,
-                                                        static_cast<uint64_t>(params.seed), true));
+    ValidateTQCodecConfig(TQCodecConfigFromPublicParams(params));
     CheckedBytes(params.dim, sizeof(float), "TurboQuant input byte size overflow");
 }
 

@@ -37,7 +37,8 @@
 namespace {
 
 VecSimParams CreateTQParams(size_t dim, VecSimMetric metric, size_t seed = 7,
-                            bool use_rotation = true, size_t bits = 8) {
+                            bool use_rotation = true, size_t bits = 8,
+                            VecSimTqProfile profile = VecSimTqProfile_Default) {
     TQFlatParams tq_params = {.type = VecSimType_FLOAT32,
                               .dim = dim,
                               .metric = metric,
@@ -47,13 +48,15 @@ VecSimParams CreateTQParams(size_t dim, VecSimMetric metric, size_t seed = 7,
                               .bits = bits,
                               .projections = dim,
                               .seed = seed,
-                              .useRotation = use_rotation};
+                              .useRotation = use_rotation,
+                              .profile = profile};
     return VecSimParams{.algo = VecSimAlgo_TQ, .algoParams = {.tqFlatParams = tq_params}};
 }
 
 VecSimParams CreateTQHNSWParams(size_t dim, VecSimMetric metric, size_t seed = 7,
                                 bool use_rotation = true, size_t bits = 8, size_t m = 16,
-                                size_t ef_construction = 200, size_t ef_runtime = 50) {
+                                size_t ef_construction = 200, size_t ef_runtime = 50,
+                                VecSimTqProfile profile = VecSimTqProfile_Default) {
     TQHNSWParams tq_params = {
         .type = VecSimType_FLOAT32,
         .dim = dim,
@@ -65,6 +68,7 @@ VecSimParams CreateTQHNSWParams(size_t dim, VecSimMetric metric, size_t seed = 7
         .projections = dim,
         .seed = seed,
         .useRotation = use_rotation,
+        .profile = profile,
         .M = m,
         .efConstruction = ef_construction,
         .efRuntime = ef_runtime,
@@ -829,6 +833,130 @@ TEST(TQModelVersionTest, dense_identity_is_explicit_deterministic_and_seed_sensi
     EXPECT_EQ(TQFlatDetails::kTQConstructionScoreVersion, 1);
 }
 
+TEST(TQFactoryProfileTest, public_versions_are_stable_and_default_maps_to_dense) {
+    EXPECT_EQ(static_cast<int>(VecSimTqProfile_Default), 0);
+    EXPECT_EQ(static_cast<int>(VecSimTqProfile_DenseReferenceV1), 1);
+    EXPECT_EQ(static_cast<int>(VecSimTqProfile_FastStructuredRotationV1), 2);
+    EXPECT_EQ(static_cast<int>(VecSimTqProfile_FastStructuredV1), 3);
+
+    auto default_params = CreateTQParams(8, VecSimMetric_Cosine);
+    auto dense_params =
+        CreateTQParams(8, VecSimMetric_Cosine, 7, true, 8, VecSimTqProfile_DenseReferenceV1);
+    auto fast_rotation_params = CreateTQParams(8, VecSimMetric_Cosine, 7, true, 8,
+                                               VecSimTqProfile_FastStructuredRotationV1);
+    auto fast_params =
+        CreateTQParams(8, VecSimMetric_Cosine, 7, true, 8, VecSimTqProfile_FastStructuredV1);
+
+    const auto default_config =
+        TQFlatDetails::TQCodecConfigFromPublicParams(default_params.algoParams.tqFlatParams);
+    const auto dense_config =
+        TQFlatDetails::TQCodecConfigFromPublicParams(dense_params.algoParams.tqFlatParams);
+    const auto fast_rotation_config =
+        TQFlatDetails::TQCodecConfigFromPublicParams(fast_rotation_params.algoParams.tqFlatParams);
+    const auto fast_config =
+        TQFlatDetails::TQCodecConfigFromPublicParams(fast_params.algoParams.tqFlatParams);
+
+    EXPECT_EQ(default_config.model_transform_version,
+              TQFlatDetails::TQModelTransformVersion::DenseReferenceV1);
+    EXPECT_EQ(
+        TQFlatDetails::TQStoredDistanceModeFromPublicParams(default_params.algoParams.tqFlatParams),
+        TQFlatDetails::TQStoredDistanceMode::FullDecodeReference);
+    EXPECT_EQ(dense_config.model_transform_version,
+              TQFlatDetails::TQModelTransformVersion::DenseReferenceV1);
+    EXPECT_EQ(
+        TQFlatDetails::TQStoredDistanceModeFromPublicParams(dense_params.algoParams.tqFlatParams),
+        TQFlatDetails::TQStoredDistanceMode::FullDecodeReference);
+    EXPECT_EQ(fast_rotation_config.model_transform_version,
+              TQFlatDetails::TQModelTransformVersion::FastStructuredRotationV1);
+    EXPECT_EQ(fast_rotation_config.rotation_backend_version,
+              TQFlatDetails::TQRotationBackendVersion::FastStructuredV1);
+    EXPECT_EQ(fast_rotation_config.qjl_backend_version,
+              TQFlatDetails::TQQjlBackendVersion::DenseGaussianV1);
+    EXPECT_EQ(TQFlatDetails::TQStoredDistanceModeFromPublicParams(
+                  fast_rotation_params.algoParams.tqFlatParams),
+              TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+    EXPECT_EQ(fast_config.model_transform_version,
+              TQFlatDetails::TQModelTransformVersion::FastStructuredV1);
+    EXPECT_EQ(fast_config.rotation_backend_version,
+              TQFlatDetails::TQRotationBackendVersion::FastStructuredV1);
+    EXPECT_EQ(fast_config.qjl_backend_version,
+              TQFlatDetails::TQQjlBackendVersion::CirculantGaussianV1);
+    EXPECT_EQ(
+        TQFlatDetails::TQStoredDistanceModeFromPublicParams(fast_params.algoParams.tqFlatParams),
+        TQFlatDetails::TQStoredDistanceMode::CoarseMse);
+}
+
+TEST(TQFactoryProfileTest, flat_and_hnsw_factories_create_each_profile) {
+    constexpr size_t dim = 8;
+    const std::array<float, dim> vector = {0.8f, -0.4f, 0.2f, -0.1f, 0.7f, 0.3f, -0.2f, 0.5f};
+    const std::array<float, dim> query = {-0.1f, 0.6f, 0.3f, 0.8f, -0.5f, 0.2f, 0.4f, -0.7f};
+    for (auto profile : {VecSimTqProfile_DenseReferenceV1, VecSimTqProfile_FastStructuredRotationV1,
+                         VecSimTqProfile_FastStructuredV1}) {
+        for (auto algo : {VecSimAlgo_TQ, VecSimAlgo_TQ_HNSW}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "profile=" << static_cast<int>(profile) << " algo=" << algo);
+            auto params =
+                algo == VecSimAlgo_TQ
+                    ? CreateTQParams(dim, VecSimMetric_Cosine, 17, true, 4, profile)
+                    : CreateTQHNSWParams(dim, VecSimMetric_Cosine, 17, true, 4, 4, 32, 16, profile);
+            EXPECT_GT(VecSimIndex_EstimateInitialSize(&params), 0U);
+            EXPECT_GT(VecSimIndex_EstimateElementSize(&params), 0U);
+            std::unique_ptr<VecSimIndex, decltype(&VecSimIndex_Free)> index(
+                VecSimIndex_New(&params), VecSimIndex_Free);
+            ASSERT_NE(index, nullptr);
+            EXPECT_EQ(VecSimIndex_AddVector(index.get(), vector.data(), 1), 1);
+            EXPECT_TRUE(
+                std::isfinite(VecSimIndex_GetDistanceFrom_Unsafe(index.get(), 1, query.data())));
+        }
+    }
+}
+
+TEST(TQFactoryProfileTest, initial_size_estimators_track_selected_model_state) {
+    const auto flat_estimate = [](VecSimTqProfile profile) {
+        const auto params = CreateTQParams(32, VecSimMetric_Cosine, 17, true, 4, profile);
+        return VecSimIndex_EstimateInitialSize(&params);
+    };
+    const auto hnsw_estimate = [](VecSimTqProfile profile) {
+        const auto params =
+            CreateTQHNSWParams(32, VecSimMetric_Cosine, 17, true, 4, 4, 32, 16, profile);
+        return VecSimIndex_EstimateInitialSize(&params);
+    };
+
+    EXPECT_GT(flat_estimate(VecSimTqProfile_DenseReferenceV1),
+              flat_estimate(VecSimTqProfile_FastStructuredRotationV1));
+    EXPECT_GT(flat_estimate(VecSimTqProfile_FastStructuredRotationV1),
+              flat_estimate(VecSimTqProfile_FastStructuredV1));
+    EXPECT_GT(hnsw_estimate(VecSimTqProfile_DenseReferenceV1),
+              hnsw_estimate(VecSimTqProfile_FastStructuredRotationV1));
+    EXPECT_GT(hnsw_estimate(VecSimTqProfile_FastStructuredRotationV1),
+              hnsw_estimate(VecSimTqProfile_FastStructuredV1));
+}
+
+TEST(TQFactoryProfileTest, hnsw_factory_binds_profile_construction_distance) {
+    constexpr size_t dim = 8;
+    for (auto profile :
+         {VecSimTqProfile_Default, VecSimTqProfile_DenseReferenceV1,
+          VecSimTqProfile_FastStructuredRotationV1, VecSimTqProfile_FastStructuredV1}) {
+        SCOPED_TRACE(::testing::Message() << "profile=" << static_cast<int>(profile));
+        TQFlatDetails::ResetCoarseMseDiagnostics();
+        auto params = CreateTQHNSWParams(dim, VecSimMetric_IP, 23, true, 4, 4, 32, 16, profile);
+        std::unique_ptr<VecSimIndex, decltype(&VecSimIndex_Free)> index(VecSimIndex_New(&params),
+                                                                        VecSimIndex_Free);
+        ASSERT_NE(index, nullptr);
+        for (size_t label = 0; label < 24; ++label) {
+            std::array<float, dim> vector{};
+            for (size_t coordinate = 0; coordinate < dim; ++coordinate) {
+                vector[coordinate] =
+                    std::sin(static_cast<float>((label + 3) * (coordinate + 5)) * 0.113f);
+            }
+            ASSERT_EQ(VecSimIndex_AddVector(index.get(), vector.data(), label), 1);
+        }
+        const bool is_fast = profile == VecSimTqProfile_FastStructuredRotationV1 ||
+                             profile == VecSimTqProfile_FastStructuredV1;
+        EXPECT_EQ(TQFlatDetails::GetCoarseMseStoredDistanceCalls() > 0, is_fast);
+    }
+}
+
 TEST(TQModelVersionTest, unsupported_component_and_profile_versions_fail_without_leaking) {
     auto allocator = VecSimAllocator::newVecsimAllocator();
     const uint64_t baseline = allocator->getAllocationSize();
@@ -961,6 +1089,9 @@ TEST(TQFactoryValidationTest, flat_creation_and_both_estimators_reject_the_same_
     invalid.algoParams.tqFlatParams.useRotation = false;
     expect_rejected(invalid);
     invalid = valid;
+    invalid.algoParams.tqFlatParams.profile = static_cast<VecSimTqProfile>(255);
+    expect_rejected(invalid);
+    invalid = valid;
     invalid.algoParams.tqFlatParams.multi = true;
     expect_rejected(invalid);
 }
@@ -996,6 +1127,9 @@ TEST(TQFactoryValidationTest, hnsw_creation_and_both_estimators_reject_the_same_
     invalid = valid;
     invalid.algoParams.tqHnswParams.useRotation = false;
     expect_rejected(invalid);
+    invalid = valid;
+    invalid.algoParams.tqHnswParams.profile = static_cast<VecSimTqProfile>(255);
+    expect_rejected(invalid);
 }
 
 TEST(TQFactoryValidationTest, checked_payload_matrix_and_capacity_arithmetic_rejects_overflow) {
@@ -1024,8 +1158,7 @@ TEST(TQFactoryValidationTest, c_estimators_contain_checked_tq_failures) {
     };
 
     auto hostile_capacity = CreateTQHNSWParams(8, VecSimMetric_Cosine);
-    hostile_capacity.algoParams.tqHnswParams.initialCapacity =
-        std::numeric_limits<size_t>::max();
+    hostile_capacity.algoParams.tqHnswParams.initialCapacity = std::numeric_limits<size_t>::max();
     expect_contained(hostile_capacity, true, false);
 
     auto hostile_degree = CreateTQHNSWParams(8, VecSimMetric_Cosine);

@@ -174,6 +174,20 @@ typedef struct {
     size_t blockSize;
 } BFParams;
 
+/**
+ * Immutable TurboQuant model profiles.
+ *
+ * Default preserves the original dense production model for callers that zero-initialize the
+ * public parameter structs. The versioned values are stable API identifiers; unknown values must
+ * be rejected rather than interpreted as another model.
+ */
+typedef enum {
+    VecSimTqProfile_Default = 0,
+    VecSimTqProfile_DenseReferenceV1 = 1,
+    VecSimTqProfile_FastStructuredRotationV1 = 2,
+    VecSimTqProfile_FastStructuredV1 = 3,
+} VecSimTqProfile;
+
 typedef struct {
     VecSimType type;        // Input datatype for vectors and queries.
     size_t dim;             // Vector's dimension.
@@ -181,10 +195,11 @@ typedef struct {
     bool multi;             // Multi-value indexing is not currently supported.
     size_t initialCapacity; // Deprecated.
     size_t blockSize;
-    size_t bits;        // Total Algorithm 2 bit budget per coordinate.
-    size_t projections; // Number of QJL rows; paper-faithful mode requires dim.
-    size_t seed;        // Seed for deterministic rotation and QJL projections.
-    bool useRotation;   // Apply deterministic random rotation before quantization.
+    size_t bits;             // Total Algorithm 2 bit budget per coordinate.
+    size_t projections;      // Number of QJL rows; paper-faithful mode requires dim.
+    size_t seed;             // Seed for deterministic rotation and QJL projections.
+    bool useRotation;        // Apply deterministic random rotation before quantization.
+    VecSimTqProfile profile; // Immutable model/backend profile; Default selects DenseReferenceV1.
 } TQFlatParams;
 
 typedef struct {
@@ -194,10 +209,11 @@ typedef struct {
     bool multi;             // Determines if the index should multi-index or not.
     size_t initialCapacity; // Deprecated.
     size_t blockSize;
-    size_t bits;        // Total Algorithm 2 bit budget per coordinate.
-    size_t projections; // Number of QJL rows; paper-faithful mode requires dim.
-    size_t seed;        // Seed for deterministic rotation and QJL projections.
-    bool useRotation;   // Apply deterministic random rotation before quantization.
+    size_t bits;             // Total Algorithm 2 bit budget per coordinate.
+    size_t projections;      // Number of QJL rows; paper-faithful mode requires dim.
+    size_t seed;             // Seed for deterministic rotation and QJL projections.
+    bool useRotation;        // Apply deterministic random rotation before quantization.
+    VecSimTqProfile profile; // Immutable model/backend profile; Default selects DenseReferenceV1.
     size_t M;
     size_t efConstruction;
     size_t efRuntime;

@@ -78,6 +78,7 @@ inline TQFlatParams AsTQFlatParams(const TQHNSWParams &params) {
         .projections = params.projections,
         .seed = params.seed,
         .useRotation = params.useRotation,
+        .profile = params.profile,
     };
 }
 
@@ -111,7 +112,9 @@ VecSimIndex *NewTQIndexImpl(const VecSimParams *params) {
     const auto &tq_params = params->algoParams.tqHnswParams;
     auto allocator = VecSimAllocator::newVecsimAllocator();
     const auto tq_core_params = AsTQFlatParams(tq_params);
-    auto components = TQFlatDetails::CreateTQHNSWComponents<Metric>(allocator, &tq_core_params);
+    auto components = TQFlatDetails::CreateTQHNSWComponents<Metric>(
+        allocator, &tq_core_params,
+        TQFlatDetails::TQStoredDistanceModeFromPublicParams(tq_core_params));
     auto stored_data_size = TQFlatDetails::GetStorageDataSize<Metric>(&tq_core_params);
     auto abstract_init_params =
         NewTQAbstractInitParams(&tq_params, params->logCtx, allocator, stored_data_size);
@@ -258,8 +261,8 @@ size_t EstimateTQInitialSizeImpl(const TQHNSWParams *params) {
     AddTQEstimate(est, allocations_overhead + sizeof(TQFlatDetails::TQDistanceCalculator<Metric>));
     AddTQEstimate(est, allocations_overhead + sizeof(MultiPreprocessorsContainer<float, 1>));
     AddTQEstimate(est, allocations_overhead + sizeof(TQFlatDetails::TQPreprocessor<Metric>));
-    AddTQEstimate(est, TQFlatDetails::EstimateDenseReferenceTQModelAllocationSize(
-                           params->dim, params->bits, params->projections, params->seed));
+    AddTQEstimate(est, TQFlatDetails::EstimateTQModelAllocationSize(
+                           TQFlatDetails::TQCodecConfigFromPublicParams(AsTQFlatParams(*params))));
     AddTQEstimate(est, sizeof(DataBlocksContainer) + allocations_overhead);
     const size_t rounded_capacity =
         TQFlatDetails::CheckedRoundUpCapacity(params->initialCapacity, params->blockSize);
