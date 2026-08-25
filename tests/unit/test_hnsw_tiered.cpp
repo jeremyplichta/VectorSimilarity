@@ -2123,9 +2123,9 @@ TYPED_TEST(HNSWTieredIndexTest, swapJobBasic) {
     EXPECT_EQ(tiered_index->getAllocationSize(), initial_mem);
     mock_thread_pool.reset_ctx();
 
-    // VecSimAllocator::allocation_header_size = size_t, this should be the only memory that we
-    // account for at this point.
-    EXPECT_EQ(allocator->getAllocationSize(), sizeof(size_t));
+    // Only the allocator object itself should remain. BUILD_TESTS adds the allocation counter to
+    // that object, so compare with the type rather than its historical one-size_t layout.
+    EXPECT_EQ(allocator->getAllocationSize(), sizeof(VecSimAllocator));
 }
 
 TYPED_TEST(HNSWTieredIndexTest, swapJobBasic2) {
