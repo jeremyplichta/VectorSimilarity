@@ -97,6 +97,10 @@ if(USE_SVS)
         FetchContent_MakeAvailable(svs)
         list(APPEND CMAKE_PREFIX_PATH "${svs_SOURCE_DIR}")
         find_package(svs REQUIRED)
+        # The downloaded package exposes its optional compression headers from
+        # this include root. Keep the capability probe below tied to the same
+        # package instead of an unset path, which otherwise disables LVQ/LeanVec.
+        set(SVS_HEADER_ROOT "${svs_SOURCE_DIR}/include")
         set(SVS_LVQ_HEADER "svs/extensions/vamana/lvq.h")
         set(SVS_LEANVEC_HEADER "svs/extensions/vamana/leanvec.h")
     else()
