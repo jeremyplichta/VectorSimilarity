@@ -902,6 +902,8 @@ TEST(TQFactoryValidationTest, flat_creation_and_both_estimators_reject_the_same_
                      std::invalid_argument);
         EXPECT_THROW(TQFactory::EstimateElementSize(&params.algoParams.tqFlatParams),
                      std::invalid_argument);
+        EXPECT_EQ(VecSimIndex_EstimateInitialSize(&params), 0);
+        EXPECT_EQ(VecSimIndex_EstimateElementSize(&params), 0);
     };
 
     auto invalid = valid;
@@ -936,6 +938,8 @@ TEST(TQFactoryValidationTest, hnsw_creation_and_both_estimators_reject_the_same_
                      std::invalid_argument);
         EXPECT_THROW(HNSWFactory::EstimateElementSize(&params.algoParams.tqHnswParams),
                      std::invalid_argument);
+        EXPECT_EQ(VecSimIndex_EstimateInitialSize(&params), 0);
+        EXPECT_EQ(VecSimIndex_EstimateElementSize(&params), 0);
     };
 
     auto invalid = valid;
@@ -967,6 +971,35 @@ TEST(TQFactoryValidationTest, checked_payload_matrix_and_capacity_arithmetic_rej
                  std::overflow_error);
     EXPECT_THROW(TQFlatDetails::CheckedRoundUpCapacity(std::numeric_limits<size_t>::max() - 1, 4),
                  std::overflow_error);
+}
+
+TEST(TQFactoryValidationTest, c_estimators_contain_checked_tq_failures) {
+    const auto expect_contained = [](const VecSimParams &params, bool initial_size,
+                                     bool element_size) {
+        if (initial_size) {
+            EXPECT_THROW(HNSWFactory::EstimateInitialSize(&params.algoParams.tqHnswParams),
+                         std::overflow_error);
+            EXPECT_EQ(VecSimIndex_EstimateInitialSize(&params), 0);
+        }
+        if (element_size) {
+            EXPECT_THROW(HNSWFactory::EstimateElementSize(&params.algoParams.tqHnswParams),
+                         std::overflow_error);
+            EXPECT_EQ(VecSimIndex_EstimateElementSize(&params), 0);
+        }
+    };
+
+    auto hostile_capacity = CreateTQHNSWParams(8, VecSimMetric_Cosine);
+    hostile_capacity.algoParams.tqHnswParams.initialCapacity =
+        std::numeric_limits<size_t>::max();
+    expect_contained(hostile_capacity, true, false);
+
+    auto hostile_degree = CreateTQHNSWParams(8, VecSimMetric_Cosine);
+    hostile_degree.algoParams.tqHnswParams.M = std::numeric_limits<size_t>::max();
+    expect_contained(hostile_degree, true, true);
+
+    auto hostile_model =
+        CreateTQHNSWParams(std::numeric_limits<size_t>::max(), VecSimMetric_Cosine);
+    expect_contained(hostile_model, true, true);
 }
 
 TEST(TQFlatTest, rejects_non_paper_parameters) {

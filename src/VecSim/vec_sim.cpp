@@ -217,7 +217,11 @@ extern "C" VecSimIndex *VecSimIndex_New(const VecSimParams *params) {
 }
 
 extern "C" size_t VecSimIndex_EstimateInitialSize(const VecSimParams *params) {
-    return VecSimFactory::EstimateInitialSize(params);
+    try {
+        return VecSimFactory::EstimateInitialSize(params);
+    } catch (...) {
+        return 0;
+    }
 }
 
 extern "C" int VecSimIndex_AddVector(VecSimIndex *index, const void *blob, size_t label) {
@@ -234,7 +238,11 @@ extern "C" double VecSimIndex_GetDistanceFrom_Unsafe(VecSimIndex *index, size_t 
 }
 
 extern "C" size_t VecSimIndex_EstimateElementSize(const VecSimParams *params) {
-    return VecSimFactory::EstimateElementSize(params);
+    try {
+        return VecSimFactory::EstimateElementSize(params);
+    } catch (...) {
+        return 0;
+    }
 }
 
 extern "C" void VecSim_Normalize(void *blob, size_t dim, VecSimType type) {

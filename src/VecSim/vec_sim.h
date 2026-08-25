@@ -31,7 +31,7 @@ VecSimIndex *VecSimIndex_New(const VecSimParams *params);
  * @brief Estimates the size of an empty index according to the parameters.
  * @param params index configurations (initial size, data type, dimension, metric, algorithm and the
  * algorithm-related params).
- * @return Estimated index size.
+ * @return Estimated index size, or 0 if the parameters cannot be estimated safely.
  */
 size_t VecSimIndex_EstimateInitialSize(const VecSimParams *params);
 
@@ -44,7 +44,8 @@ size_t VecSimIndex_EstimateInitialSize(const VecSimParams *params);
  * ("memory limit for a block" / "size of a single vector in a block" = "block size")
  * @param params index configurations (initial size, data type, dimension, metric, algorithm and the
  * algorithm-related params).
- * @return The estimated single vector memory consumption, considering the parameters.
+ * @return The estimated single vector memory consumption, considering the parameters, or 0 if the
+ * parameters cannot be estimated safely.
  */
 size_t VecSimIndex_EstimateElementSize(const VecSimParams *params);
 
