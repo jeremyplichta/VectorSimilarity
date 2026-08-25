@@ -14,6 +14,7 @@ if [ -z "$BM_TYPE"  ] || [ "$BM_TYPE" = "benchmarks-all" ]; then
     echo svs_training_fp16
     echo basics_svs_single_fp32
     echo basics_svs_single_fp32_LVQ8
+    echo tq_production_fp32
     echo spaces_fp32
     echo spaces_fp64
     echo spaces_bf16
@@ -36,6 +37,12 @@ elif [ "$BM_TYPE" = "benchmarks-default" ]; then
     echo spaces_sq8_fp32
     echo spaces_sq8_fp16
     echo spaces_sq8_sq8
+
+# TurboQuant production-dimension benchmark. The executable defaults to a tiny,
+# deterministic smoke matrix; pass --tq-mode=full directly to run the production
+# matrix documented by Story 05.
+elif [ "$BM_TYPE" = "bm-tq-production" ] ; then
+    echo tq_production_fp32
 
 
 # Basic benchmarks

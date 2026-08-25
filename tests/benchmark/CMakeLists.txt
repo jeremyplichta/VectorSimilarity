@@ -25,6 +25,33 @@ foreach(benchmark IN ITEMS ${BENCHMARKS})
 	target_link_libraries(bm_${benchmark} VectorSimilarity benchmark::benchmark gtest)
 endforeach()
 
+execute_process(COMMAND git -C ${root} rev-parse --short HEAD
+                OUTPUT_VARIABLE TQ_BENCH_GIT_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND git -C ${root} status --porcelain
+                OUTPUT_VARIABLE TQ_BENCH_GIT_STATUS OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(TQ_BENCH_GIT_STATUS)
+  set(TQ_BENCH_GIT_DIRTY "dirty")
+else()
+  set(TQ_BENCH_GIT_DIRTY "clean")
+endif()
+if(CMAKE_BUILD_TYPE)
+  set(TQ_BENCH_BUILD_MODE "${CMAKE_BUILD_TYPE}")
+else()
+  set(TQ_BENCH_BUILD_MODE "multi-config")
+endif()
+
+# The TurboQuant production benchmark owns its runner so it can emit the reproducibility
+# metadata and explicit `not_implemented` records required by the production matrix.  It is
+# intentionally a CTest smoke target; the full 6-dimension matrix is invoked manually.
+if("tq_production_fp32" IN_LIST BENCHMARKS)
+	target_compile_definitions(bm_tq_production_fp32 PRIVATE
+		TQ_BENCH_GIT_COMMIT="${TQ_BENCH_GIT_COMMIT}"
+		TQ_BENCH_GIT_DIRTY="${TQ_BENCH_GIT_DIRTY}"
+		TQ_BENCH_BUILD_MODE="${TQ_BENCH_BUILD_MODE}")
+	add_test(NAME bm_tq_production_smoke COMMAND bm_tq_production_fp32 --tq-mode=smoke)
+	set_tests_properties(bm_tq_production_smoke PROPERTIES LABELS "benchmark;turboquant;smoke")
+endif()
+
 include(GoogleTest)
 
 if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "(aarch64)|(arm64)|(ARM64)|(armv.*)")
