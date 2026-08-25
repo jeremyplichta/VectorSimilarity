@@ -57,6 +57,52 @@ inline MemoryUtils::unique_blob AllocateTQScratch(const TQModelState &state, siz
     return scratch;
 }
 
+/**
+ * Reusable, operation-local TurboQuant preprocessing state. The generic FP32 workspace and the
+ * selected QJL backend's scratch are allocated once here. Callers that retain a context can encode
+ * and preprocess queries repeatedly without further allocator activity, provided destination
+ * blobs are also retained. A context belongs to one immutable model and is not thread-safe; use
+ * one context per concurrent worker.
+ */
+class TQOperationContext {
+public:
+    explicit TQOperationContext(std::shared_ptr<const TQModelState> state)
+        : state(validateState(std::move(state))),
+          generic_scratch(AllocateTQScratch(
+              *this->state, CheckedMultiply(this->state->dim, size_t{6},
+                                            "TurboQuant reusable operation scratch overflow"))),
+          qjl_scratch(this->state->createQjlScratch()) {}
+
+    TQOperationContext(const TQOperationContext &) = delete;
+    TQOperationContext &operator=(const TQOperationContext &) = delete;
+    TQOperationContext(TQOperationContext &&) noexcept = default;
+    TQOperationContext &operator=(TQOperationContext &&) noexcept = default;
+
+private:
+    template <VecSimMetric Metric>
+    friend class TQPreprocessor;
+
+    void validate(const TQModelState *expected) const {
+        if (state.get() != expected) {
+            throw std::invalid_argument("TurboQuant operation context belongs to another model");
+        }
+    }
+
+    static std::shared_ptr<const TQModelState>
+    validateState(std::shared_ptr<const TQModelState> state) {
+        if (!state) {
+            throw std::invalid_argument("TurboQuant operation context requires model state");
+        }
+        return state;
+    }
+
+    float *words() const { return static_cast<float *>(generic_scratch.get()); }
+
+    std::shared_ptr<const TQModelState> state;
+    MemoryUtils::unique_blob generic_scratch;
+    TQModelState::QjlScratch qjl_scratch;
+};
+
 template <VecSimMetric Metric>
 class TQDistanceCalculator : public IndexCalculatorInterface<float> {
 private:
@@ -73,8 +119,11 @@ private:
         float *lhs_transform_scratch = lhs_rotated + dim;
         float *rhs_rotated = lhs_transform_scratch + dim;
         float *rhs_transform_scratch = rhs_rotated + dim;
-        state->decode(state->storageView(lhs_blob), lhs, lhs_rotated, lhs_transform_scratch);
-        state->decode(state->storageView(rhs_blob), rhs, rhs_rotated, rhs_transform_scratch);
+        auto qjl_scratch = state->createQjlScratch();
+        state->decode(state->storageView(lhs_blob), lhs, lhs_rotated, lhs_transform_scratch,
+                      qjl_scratch);
+        state->decode(state->storageView(rhs_blob), rhs, rhs_rotated, rhs_transform_scratch,
+                      qjl_scratch);
 
         if constexpr (Metric == VecSimMetric_Cosine) {
             NormalizeInPlace(lhs, dim);
@@ -186,14 +235,19 @@ public:
                    std::shared_ptr<const TQModelState> state)
         : PreprocessorInterface(allocator), state(std::move(state)) {}
 
+    TQOperationContext createOperationContext() const { return TQOperationContext(state); }
+
     void preprocess(const void *original_blob, void *&storage_blob, void *&query_blob,
                     size_t &storage_blob_size, size_t &query_blob_size,
                     unsigned char storage_alignment, unsigned char query_alignment) const override {
         const bool owns_storage_on_success = storage_blob == nullptr;
         const bool owns_query_on_success = query_blob == nullptr;
-        preprocessForStorage(original_blob, storage_blob, storage_blob_size, storage_alignment);
+        auto context = createOperationContext();
+        preprocessForStorageWithContext(original_blob, storage_blob, storage_blob_size,
+                                        storage_alignment, context);
         try {
-            preprocessQuery(original_blob, query_blob, query_blob_size, query_alignment);
+            preprocessQueryWithContext(original_blob, query_blob, query_blob_size, query_alignment,
+                                       context);
         } catch (...) {
             if (owns_storage_on_success) {
                 this->allocator->free_allocation(storage_blob);
@@ -210,9 +264,15 @@ public:
     void preprocessForStorage(const void *original_blob, void *&storage_blob,
                               size_t &input_blob_size,
                               unsigned char storage_alignment) const override {
-        auto scratch =
-            AllocateTQScratch(*state, CheckedMultiply(state->dim, size_t{6},
-                                                      "TurboQuant storage scratch size overflow"));
+        auto context = createOperationContext();
+        preprocessForStorageWithContext(original_blob, storage_blob, input_blob_size,
+                                        storage_alignment, context);
+    }
+
+    void preprocessForStorageWithContext(const void *original_blob, void *&storage_blob,
+                                         size_t &input_blob_size, unsigned char storage_alignment,
+                                         TQOperationContext &context) const {
+        context.validate(state.get());
         if (!storage_blob) {
             storage_blob =
                 this->allocator->allocate_aligned(state->storageBlobSize(), storage_alignment);
@@ -223,7 +283,7 @@ public:
         std::memset(storage_blob, 0, state->storageBlobSize());
 
         const auto *input = static_cast<const float *>(original_blob);
-        auto *words = static_cast<float *>(scratch.get());
+        auto *words = context.words();
         float *unit = words;
         float *reconstructed = unit + state->dim;
         float *residual = reconstructed + state->dim;
@@ -252,11 +312,11 @@ public:
             for (size_t i = 0; i < state->dim; ++i) {
                 residual[i] *= inverse_residual_norm;
             }
-            state->packResidualSigns(residual, signs, rotated, transform_scratch);
+            state->packResidualSigns(residual, signs, rotated, context.qjl_scratch);
         } else {
-            // sign(0) is +1. The signs are ignored because gamma is zero, but keeping the
-            // canonical mathematical value makes byte-level tests unambiguous.
-            state->packResidualSigns(residual, signs, rotated, transform_scratch);
+            // A nonzero source with a zero residual still persists sign(0) = +1 for every used
+            // projection bit. A zero source returned before this point and leaves its blob zero.
+            state->packResidualSigns(residual, signs, rotated, context.qjl_scratch);
         }
 
         const float source_scale = Metric == VecSimMetric_Cosine ? 1.0f : original_norm;
@@ -266,12 +326,17 @@ public:
 
     void preprocessQuery(const void *original_blob, void *&query_blob, size_t &input_blob_size,
                          unsigned char alignment) const override {
+        auto context = createOperationContext();
+        preprocessQueryWithContext(original_blob, query_blob, input_blob_size, alignment, context);
+    }
+
+    void preprocessQueryWithContext(const void *original_blob, void *&query_blob,
+                                    size_t &input_blob_size, unsigned char alignment,
+                                    TQOperationContext &context) const {
 #ifdef BUILD_TESTS
         query_preprocessing_count.fetch_add(1);
 #endif
-        auto scratch =
-            AllocateTQScratch(*state, CheckedMultiply(state->dim, size_t{2},
-                                                      "TurboQuant query scratch size overflow"));
+        context.validate(state.get());
         if (!query_blob) {
             query_blob = this->allocator->allocate_aligned(state->queryBlobSize(), alignment);
             if (!query_blob) {
@@ -280,7 +345,7 @@ public:
         }
 
         const auto *input = static_cast<const float *>(original_blob);
-        auto *query = static_cast<float *>(scratch.get());
+        auto *query = context.words();
         auto *backend_scratch = query + state->dim;
         std::copy(input, input + state->dim, query);
         if constexpr (Metric == VecSimMetric_Cosine) {
@@ -292,7 +357,7 @@ public:
         auto *projected = rotated + state->dim;
         auto *norm_sq = projected + state->projections;
         state->applyRotation(query, rotated, backend_scratch);
-        state->projectQjl(query, projected, backend_scratch);
+        state->projectQjl(query, projected, context.qjl_scratch);
         *norm_sq = SumSquaresScalar(query, state->dim);
         input_blob_size = state->queryBlobSize();
     }
@@ -326,11 +391,15 @@ inline size_t GetStorageDataSize(const TQFlatParams *params) {
 
 template <VecSimMetric Metric>
 inline IndexComponents<float, float> CreateTQComponents(
-    std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params,
+    std::shared_ptr<VecSimAllocator> allocator, std::shared_ptr<const TQModelState> state,
     TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference) {
-    auto state =
-        AllocateDenseReferenceTQModelState(allocator, params->dim, params->bits,
-                                           params->projections, params->seed, params->useRotation);
+    if (!allocator || !state) {
+        throw std::invalid_argument("TurboQuant components require allocator and model state");
+    }
+    if (state->getAllocator() != allocator) {
+        throw std::invalid_argument(
+            "TurboQuant components and model state must share one VecSim allocator");
+    }
     auto index_calculator = std::unique_ptr<TQDistanceCalculator<Metric>>(
         new (allocator) TQDistanceCalculator<Metric>(allocator, state, stored_distance_mode));
     auto preprocessors = std::unique_ptr<MultiPreprocessorsContainer<float, 1>>(
@@ -346,6 +415,24 @@ inline IndexComponents<float, float> CreateTQComponents(
 }
 
 template <VecSimMetric Metric>
+inline IndexComponents<float, float> CreateTQComponents(
+    std::shared_ptr<VecSimAllocator> allocator, TQCodecConfig config,
+    TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference) {
+    auto state = AllocateTQModelState(allocator, std::move(config));
+    return CreateTQComponents<Metric>(std::move(allocator), std::move(state), stored_distance_mode);
+}
+
+template <VecSimMetric Metric>
+inline IndexComponents<float, float> CreateTQComponents(
+    std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params,
+    TQStoredDistanceMode stored_distance_mode = TQStoredDistanceMode::FullDecodeReference) {
+    auto state =
+        AllocateDenseReferenceTQModelState(allocator, params->dim, params->bits,
+                                           params->projections, params->seed, params->useRotation);
+    return CreateTQComponents<Metric>(std::move(allocator), std::move(state), stored_distance_mode);
+}
+
+template <VecSimMetric Metric>
 inline IndexComponents<float, float>
 CreateTQHNSWComponents(std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params) {
     return CreateTQComponents<Metric>(std::move(allocator), params,
@@ -357,6 +444,22 @@ inline IndexComponents<float, float>
 CreateTQHNSWComponents(std::shared_ptr<VecSimAllocator> allocator, const TQFlatParams *params,
                        TQStoredDistanceMode stored_distance_mode) {
     return CreateTQComponents<Metric>(std::move(allocator), params, stored_distance_mode);
+}
+
+template <VecSimMetric Metric>
+inline IndexComponents<float, float>
+CreateTQHNSWComponents(std::shared_ptr<VecSimAllocator> allocator, TQCodecConfig config,
+                       TQStoredDistanceMode stored_distance_mode) {
+    return CreateTQComponents<Metric>(std::move(allocator), std::move(config),
+                                      stored_distance_mode);
+}
+
+template <VecSimMetric Metric>
+inline IndexComponents<float, float>
+CreateTQHNSWComponents(std::shared_ptr<VecSimAllocator> allocator,
+                       std::shared_ptr<const TQModelState> state,
+                       TQStoredDistanceMode stored_distance_mode) {
+    return CreateTQComponents<Metric>(std::move(allocator), std::move(state), stored_distance_mode);
 }
 
 class TQFlatIndex : public BruteForceIndex_Single<float, float> {

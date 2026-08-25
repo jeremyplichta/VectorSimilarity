@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include "VecSim/algorithms/tq/tq_circulant_gaussian_qjl.h"
 #include "VecSim/algorithms/tq/tq_fast_structured_rotation.h"
 #include "VecSim/memory/vecsim_malloc.h"
 
@@ -171,6 +172,23 @@ struct TQCodecConfig {
                 .qjl_seed = seed + kQjlSeedOffset,
                 .use_rotation = true};
     }
+
+    static TQCodecConfig FastStructured(size_t dimension, size_t total_bits, size_t projections,
+                                        uint64_t seed) {
+        return {.dimension = dimension,
+                .total_bits = total_bits,
+                .mse_bits = MseBits(total_bits),
+                .projections = projections,
+                .metric_contract = TQMetricContract::CosineOrInnerProductV1,
+                .codec_version = TQCodecVersion::PaperEstimatorV1,
+                .payload_layout_version = TQPayloadLayoutVersion::PaperV1,
+                .model_transform_version = TQModelTransformVersion::FastStructuredV1,
+                .rotation_backend_version = TQRotationBackendVersion::FastStructuredV1,
+                .qjl_backend_version = TQQjlBackendVersion::CirculantGaussianV1,
+                .rotation_seed = seed,
+                .qjl_seed = seed + kQjlSeedOffset,
+                .use_rotation = true};
+    }
 };
 
 struct TQModelIdentity {
@@ -185,6 +203,9 @@ struct TQModelIdentity {
     TQQjlBackendVersion qjl_backend_version;
     uint64_t rotation_seed;
     uint64_t qjl_seed;
+    uint8_t qjl_gaussian_generation_version;
+    uint8_t qjl_sign_generation_version;
+    uint8_t qjl_convolution_version;
     bool use_rotation;
 
     bool operator==(const TQModelIdentity &other) const {
@@ -196,6 +217,9 @@ struct TQModelIdentity {
                rotation_backend_version == other.rotation_backend_version &&
                qjl_backend_version == other.qjl_backend_version &&
                rotation_seed == other.rotation_seed && qjl_seed == other.qjl_seed &&
+               qjl_gaussian_generation_version == other.qjl_gaussian_generation_version &&
+               qjl_sign_generation_version == other.qjl_sign_generation_version &&
+               qjl_convolution_version == other.qjl_convolution_version &&
                use_rotation == other.use_rotation;
     }
 };
@@ -244,7 +268,13 @@ inline void ValidateTQCodecConfig(const TQCodecConfig &config) {
         }
         break;
     case TQModelTransformVersion::FastStructuredV1:
-        throw std::invalid_argument("FastStructuredV1 is not implemented yet");
+        if (config.rotation_backend_version != TQRotationBackendVersion::FastStructuredV1 ||
+            config.qjl_backend_version != TQQjlBackendVersion::CirculantGaussianV1 ||
+            !config.use_rotation) {
+            throw std::invalid_argument(
+                "FastStructuredV1 requires fast rotation and circulant Gaussian QJL");
+        }
+        break;
     default:
         throw std::invalid_argument("Unsupported TurboQuant model transform version");
     }
@@ -260,7 +290,8 @@ inline void ValidateTQCodecConfig(const TQCodecConfig &config) {
     case TQQjlBackendVersion::DenseGaussianV1:
         break;
     case TQQjlBackendVersion::CirculantGaussianV1:
-        throw std::invalid_argument("Circulant Gaussian TurboQuant QJL is not implemented yet");
+        CirculantGaussianQjlV1::requiredFftLength(config.dimension);
+        break;
     default:
         throw std::invalid_argument("Unsupported TurboQuant QJL backend version");
     }
@@ -274,7 +305,9 @@ inline void ValidateTQCodecConfig(const TQCodecConfig &config) {
         CheckedBytes(config.dimension, sizeof(size_t),
                      "TurboQuant structured rotation permutation size overflow");
     }
-    CheckedMultiply(config.projections, config.dimension, "TurboQuant dense QJL size overflow");
+    if (config.qjl_backend_version == TQQjlBackendVersion::DenseGaussianV1) {
+        CheckedMultiply(config.projections, config.dimension, "TurboQuant dense QJL size overflow");
+    }
     PackedBytes(config.dimension, config.mse_bits);
     PackedBytes(config.projections, 1);
     const size_t query_words = CheckedAdd(
@@ -576,6 +609,9 @@ public:
         return qjl_projection_rows[projection * dimension + coordinate];
     }
 
+    size_t dimensionCount() const { return dimension; }
+    size_t projectionCount() const { return projections; }
+
 private:
     size_t dimension;
     size_t projections;
@@ -621,33 +657,122 @@ private:
 
 class TQQjlBackend {
 public:
-    TQQjlBackend(const std::shared_ptr<VecSimAllocator> &allocator, const TQCodecConfig &config)
-        : version(config.qjl_backend_version), dense_gaussian(allocator, config) {}
+    using Scratch = std::variant<std::monostate, CirculantGaussianQjlV1::Scratch>;
 
-    void project(const float *input, float *output, float *scratch) const {
+    TQQjlBackend(const std::shared_ptr<VecSimAllocator> &allocator, const TQCodecConfig &config)
+        : version(config.qjl_backend_version), backend(createBackend(allocator, config)) {}
+
+    Scratch createScratch() const {
         switch (version) {
         case TQQjlBackendVersion::DenseGaussianV1:
-            dense_gaussian.project(input, output, scratch);
-            return;
+            return Scratch(std::in_place_type<std::monostate>);
         case TQQjlBackendVersion::CirculantGaussianV1:
-            break;
+            return Scratch(std::get<CirculantGaussianQjlV1>(backend).createScratch());
         }
-        throw std::logic_error("Unsupported TurboQuant QJL backend");
+        throw std::logic_error("Unsupported TurboQuant QJL scratch backend");
     }
 
-    float coefficient(size_t projection, size_t coordinate) const {
+    // Algorithm 2 stores sign(Sr), so asymmetric query scoring must pair it with forward Sq.
+    void projectQuery(const float *input, float *output, Scratch &scratch) const {
         switch (version) {
         case TQQjlBackendVersion::DenseGaussianV1:
-            return dense_gaussian.coefficient(projection, coordinate);
+            requireDenseScratch(scratch);
+            std::get<DenseGaussianQjlV1State>(backend).project(input, output, nullptr);
+            return;
         case TQQjlBackendVersion::CirculantGaussianV1:
-            break;
+            std::get<CirculantGaussianQjlV1>(backend).projectQuery(
+                input, output, requireCirculantScratch(scratch));
+            return;
         }
-        throw std::logic_error("Unsupported TurboQuant inverse-QJL backend");
+        throw std::logic_error("Unsupported TurboQuant query-QJL backend");
+    }
+
+    void addDecodedResidual(const uint8_t *packed_signs, float scale, float *output,
+                            float *sign_workspace, Scratch &scratch) const {
+        switch (version) {
+        case TQQjlBackendVersion::DenseGaussianV1: {
+            requireDenseScratch(scratch);
+            const auto &dense = std::get<DenseGaussianQjlV1State>(backend);
+            for (size_t coordinate = 0; coordinate < dense.dimensionCount(); ++coordinate) {
+                float projected_sign_sum = 0.0f;
+                for (size_t projection = 0; projection < dense.projectionCount(); ++projection) {
+                    const bool positive =
+                        (packed_signs[projection / 8] &
+                         static_cast<uint8_t>(uint8_t{1} << (projection % 8))) != 0;
+                    projected_sign_sum +=
+                        dense.coefficient(projection, coordinate) * (positive ? 1.0f : -1.0f);
+                }
+                output[coordinate] += scale * projected_sign_sum;
+            }
+            return;
+        }
+        case TQQjlBackendVersion::CirculantGaussianV1: {
+            const auto &circulant = std::get<CirculantGaussianQjlV1>(backend);
+            for (size_t projection = 0; projection < circulant.projections(); ++projection) {
+                const bool positive = (packed_signs[projection / 8] &
+                                       static_cast<uint8_t>(uint8_t{1} << (projection % 8))) != 0;
+                sign_workspace[projection] = positive ? 1.0f : -1.0f;
+            }
+            circulant.projectAdjoint(sign_workspace, sign_workspace,
+                                     requireCirculantScratch(scratch));
+            for (size_t coordinate = 0; coordinate < circulant.dimension(); ++coordinate) {
+                output[coordinate] += scale * sign_workspace[coordinate];
+            }
+            return;
+        }
+        }
+        throw std::logic_error("Unsupported TurboQuant decoded-residual backend");
+    }
+
+    uint8_t gaussianGenerationVersion() const {
+        return version == TQQjlBackendVersion::CirculantGaussianV1
+                   ? CirculantGaussianQjlV1::kGaussianGenerationVersion
+                   : uint8_t{1};
+    }
+
+    uint8_t signGenerationVersion() const {
+        return version == TQQjlBackendVersion::CirculantGaussianV1
+                   ? CirculantGaussianQjlV1::kSignGenerationVersion
+                   : uint8_t{0};
+    }
+
+    uint8_t convolutionVersion() const {
+        return version == TQQjlBackendVersion::CirculantGaussianV1
+                   ? CirculantGaussianQjlV1::kConvolutionVersion
+                   : uint8_t{0};
     }
 
 private:
+    using BackendState = std::variant<DenseGaussianQjlV1State, CirculantGaussianQjlV1>;
+
+    static BackendState createBackend(const std::shared_ptr<VecSimAllocator> &allocator,
+                                      const TQCodecConfig &config) {
+        switch (config.qjl_backend_version) {
+        case TQQjlBackendVersion::DenseGaussianV1:
+            return BackendState(std::in_place_type<DenseGaussianQjlV1State>, allocator, config);
+        case TQQjlBackendVersion::CirculantGaussianV1:
+            return BackendState(std::in_place_type<CirculantGaussianQjlV1>, allocator,
+                                config.dimension, config.qjl_seed);
+        }
+        throw std::logic_error("Unsupported TurboQuant QJL backend construction");
+    }
+
+    static void requireDenseScratch(const Scratch &scratch) {
+        if (!std::holds_alternative<std::monostate>(scratch)) {
+            throw std::invalid_argument("Dense Gaussian QJL received circulant scratch");
+        }
+    }
+
+    static CirculantGaussianQjlV1::Scratch &requireCirculantScratch(Scratch &scratch) {
+        auto *selected = std::get_if<CirculantGaussianQjlV1::Scratch>(&scratch);
+        if (selected == nullptr) {
+            throw std::invalid_argument("Circulant Gaussian QJL received dense scratch");
+        }
+        return *selected;
+    }
+
     TQQjlBackendVersion version;
-    DenseGaussianQjlV1State dense_gaussian;
+    BackendState backend;
 };
 
 struct StorageView {
@@ -668,6 +793,8 @@ private:
     std::shared_ptr<VecSimAllocator> allocator_;
 
 public:
+    using QjlScratch = TQQjlBackend::Scratch;
+
     TQModelState(std::shared_ptr<VecSimAllocator> allocator, TQCodecConfig requested_config)
         : allocator_(std::move(allocator)), config(validateAndReturn(requested_config)),
           codebook(allocator_, config.dimension, config.mse_bits),
@@ -716,11 +843,18 @@ public:
                 .qjl_backend_version = config.qjl_backend_version,
                 .rotation_seed = config.rotation_seed,
                 .qjl_seed = config.qjl_seed,
+                .qjl_gaussian_generation_version = qjl_backend.gaussianGenerationVersion(),
+                .qjl_sign_generation_version = qjl_backend.signGenerationVersion(),
+                .qjl_convolution_version = qjl_backend.convolutionVersion(),
                 .use_rotation = config.use_rotation};
     }
 
     TQPayloadLayoutVersion payloadLayoutVersion() const { return config.payload_layout_version; }
     TQModelTransformVersion modelTransformVersion() const { return config.model_transform_version; }
+    uint8_t qjlGaussianGenerationVersion() const { return qjl_backend.gaussianGenerationVersion(); }
+    uint8_t qjlSignGenerationVersion() const { return qjl_backend.signGenerationVersion(); }
+    uint8_t qjlConvolutionVersion() const { return qjl_backend.convolutionVersion(); }
+    QjlScratch createQjlScratch() const { return qjl_backend.createScratch(); }
 
     StorageView storageView(const void *blob) const {
         const auto *bytes = static_cast<const uint8_t *>(blob);
@@ -761,9 +895,19 @@ public:
         rotation_backend.inverseRotate(input, output, scratch);
     }
 
-    void projectQjl(const float *input, float *output, float *scratch = nullptr) const {
-        qjl_backend.project(input, output, scratch);
+    void projectQjl(const float *input, float *output, QjlScratch &scratch) const {
+        qjl_backend.projectQuery(input, output, scratch);
     }
+
+#ifdef BUILD_TESTS
+    // Compatibility helper for existing dense-reference unit tests. Candidate production paths
+    // create and retain an explicit QJL scratch object for the complete operation.
+    void projectQjl(const float *input, float *output, float *unused_scratch) const {
+        (void)unused_scratch;
+        auto scratch = createQjlScratch();
+        projectQjl(input, output, scratch);
+    }
+#endif
 
     uint16_t quantizeCoordinate(float value) const {
         return static_cast<uint16_t>(std::upper_bound(boundaries.begin(), boundaries.end(), value) -
@@ -810,7 +954,7 @@ public:
     }
 
     void packResidualSigns(const float *unit_residual, uint8_t *packed_signs, float *projected,
-                           float *qjl_scratch) const {
+                           QjlScratch &qjl_scratch) const {
         std::memset(packed_signs, 0, packedQjlBytes());
         projectQjl(unit_residual, projected, qjl_scratch);
         for (size_t i = 0; i < projections; ++i) {
@@ -822,14 +966,14 @@ public:
 
 #ifdef BUILD_TESTS
     void packResidualSigns(const float *unit_residual, uint8_t *packed_signs) const {
-        auto scratch = allocator_->allocate_unique(
-            CheckedBytes(CheckedMultiply(dim, size_t{2}, "TurboQuant test scratch overflow"),
-                         sizeof(float), "TurboQuant test scratch overflow"));
-        if (!scratch) {
+        auto projected = allocator_->allocate_unique(
+            CheckedBytes(dim, sizeof(float), "TurboQuant test projection scratch overflow"));
+        if (!projected) {
             throw std::bad_alloc();
         }
-        auto *projected = static_cast<float *>(scratch.get());
-        packResidualSigns(unit_residual, packed_signs, projected, projected + dim);
+        auto qjl_scratch = createQjlScratch();
+        packResidualSigns(unit_residual, packed_signs, static_cast<float *>(projected.get()),
+                          qjl_scratch);
     }
 #endif
 
@@ -868,7 +1012,7 @@ public:
     // Decode exactly as Algorithm 2. This is intentionally scalar and is used only for the
     // correctness-first stored-to-stored HNSW path.
     void decode(const StorageView &storage, float *output, float *reconstructed_rotated,
-                float *transform_scratch) const {
+                float *transform_scratch, QjlScratch &qjl_scratch) const {
         if (storage.source_scale == 0.0f) {
             std::fill(output, output + dim, 0.0f);
             return;
@@ -878,14 +1022,9 @@ public:
         }
         applyInverseRotation(reconstructed_rotated, output, transform_scratch);
         if (storage.residual_norm != 0.0f) {
-            for (size_t coordinate = 0; coordinate < dim; ++coordinate) {
-                float projected_sign_sum = 0.0f;
-                for (size_t projection = 0; projection < projections; ++projection) {
-                    const float sign = residualSignAt(storage, projection) ? 1.0f : -1.0f;
-                    projected_sign_sum += qjl_backend.coefficient(projection, coordinate) * sign;
-                }
-                output[coordinate] += storage.residual_norm * qjl_scale * projected_sign_sum;
-            }
+            qjl_backend.addDecodedResidual(storage.residual_signs,
+                                           storage.residual_norm * qjl_scale, output,
+                                           reconstructed_rotated, qjl_scratch);
         }
         for (size_t coordinate = 0; coordinate < dim; ++coordinate) {
             output[coordinate] *= storage.source_scale;
@@ -901,7 +1040,8 @@ public:
             throw std::bad_alloc();
         }
         auto *reconstructed_rotated = static_cast<float *>(scratch.get());
-        decode(storage, output, reconstructed_rotated, reconstructed_rotated + dim);
+        auto qjl_scratch = createQjlScratch();
+        decode(storage, output, reconstructed_rotated, reconstructed_rotated + dim, qjl_scratch);
     }
 #endif
 
@@ -1030,6 +1170,13 @@ AllocateFastStructuredRotationTQModelState(const std::shared_ptr<VecSimAllocator
         allocator, TQCodecConfig::FastStructuredRotation(dim, total_bits, projections, seed));
 }
 
+inline std::shared_ptr<const TQModelState>
+AllocateFastStructuredTQModelState(const std::shared_ptr<VecSimAllocator> &allocator, size_t dim,
+                                   size_t total_bits, size_t projections, uint64_t seed) {
+    return AllocateTQModelState(allocator,
+                                TQCodecConfig::FastStructured(dim, total_bits, projections, seed));
+}
+
 template <typename T>
 struct AllocateSharedSizeProbe {
     alignas(T) std::byte bytes[sizeof(T)];
@@ -1081,9 +1228,22 @@ inline size_t EstimateTQModelAllocationSize(const TQCodecConfig &config) {
         break;
     }
 
-    const size_t qjl_elements = CheckedMultiply(config.projections, config.dimension,
-                                                "TurboQuant dense QJL estimate overflow");
-    add_allocation(qjl_elements, sizeof(float));
+    switch (config.qjl_backend_version) {
+    case TQQjlBackendVersion::DenseGaussianV1: {
+        const size_t qjl_elements = CheckedMultiply(config.projections, config.dimension,
+                                                    "TurboQuant dense QJL estimate overflow");
+        add_allocation(qjl_elements, sizeof(float));
+        break;
+    }
+    case TQQjlBackendVersion::CirculantGaussianV1: {
+        const size_t fft_length = CirculantGaussianQjlV1::requiredFftLength(config.dimension);
+        add_allocation(config.dimension, sizeof(float));
+        add_allocation(config.dimension, sizeof(int8_t));
+        add_allocation(fft_length, sizeof(CirculantGaussianQjlV1::Complex));
+        add_allocation(fft_length, sizeof(CirculantGaussianQjlV1::Complex));
+        break;
+    }
+    }
     return estimate;
 }
 
@@ -1098,6 +1258,12 @@ inline size_t EstimateFastStructuredRotationTQModelAllocationSize(size_t dim, si
                                                                   uint64_t seed = 0) {
     return EstimateTQModelAllocationSize(
         TQCodecConfig::FastStructuredRotation(dim, total_bits, projections, seed));
+}
+
+inline size_t EstimateFastStructuredTQModelAllocationSize(size_t dim, size_t total_bits,
+                                                          size_t projections, uint64_t seed = 0) {
+    return EstimateTQModelAllocationSize(
+        TQCodecConfig::FastStructured(dim, total_bits, projections, seed));
 }
 
 } // namespace TQFlatDetails

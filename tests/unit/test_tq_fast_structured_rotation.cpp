@@ -426,11 +426,8 @@ TEST(FastStructuredRotationV1ModelTest, VersionValidationRejectsMismatchedOrFutu
     disabled_rotation.use_rotation = false;
     EXPECT_THROW(TQFlatDetails::ValidateTQCodecConfig(disabled_rotation), std::invalid_argument);
 
-    auto future_profile = fast;
-    future_profile.model_transform_version =
-        TQFlatDetails::TQModelTransformVersion::FastStructuredV1;
-    future_profile.qjl_backend_version = TQFlatDetails::TQQjlBackendVersion::CirculantGaussianV1;
-    EXPECT_THROW(TQFlatDetails::ValidateTQCodecConfig(future_profile), std::invalid_argument);
+    auto full_profile = TQFlatDetails::TQCodecConfig::FastStructured(8, 4, 8, 17);
+    EXPECT_NO_THROW(TQFlatDetails::ValidateTQCodecConfig(full_profile));
 }
 
 TEST(FastStructuredRotationV1ModelTest, AllocatorEstimateIncludesOnlySelectedRotationState) {

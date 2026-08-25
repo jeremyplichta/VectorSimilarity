@@ -53,6 +53,8 @@ add_executable(test_tq_paper_reference ../utils/test_main_with_timeout.cpp
 	../utils/mock_thread_pool.cpp test_tq_paper_reference.cpp tq_paper_reference.cpp unit_test_utils.cpp)
 add_executable(test_tq_fast_structured_rotation ../utils/test_main_with_timeout.cpp
 	../utils/mock_thread_pool.cpp test_tq_fast_structured_rotation.cpp unit_test_utils.cpp)
+add_executable(test_tq_circulant_gaussian_qjl ../utils/test_main_with_timeout.cpp
+	../utils/mock_thread_pool.cpp test_tq_circulant_gaussian_qjl.cpp unit_test_utils.cpp)
 
 target_link_libraries(test_hnsw PUBLIC gtest VectorSimilarity)
 target_link_libraries(test_hnsw_parallel PUBLIC gtest VectorSimilarity)
@@ -71,6 +73,7 @@ target_link_libraries(test_svs PUBLIC gtest VectorSimilarity)
 target_link_libraries(test_tq_flat PUBLIC gtest VectorSimilarity)
 target_link_libraries(test_tq_paper_reference PUBLIC gtest VectorSimilarity)
 target_link_libraries(test_tq_fast_structured_rotation PUBLIC gtest VectorSimilarity)
+target_link_libraries(test_tq_circulant_gaussian_qjl PUBLIC gtest VectorSimilarity)
 
 include(GoogleTest)
 
@@ -90,5 +93,6 @@ gtest_discover_tests(test_index_test_utils)
 gtest_discover_tests(test_tq_flat)
 gtest_discover_tests(test_tq_paper_reference)
 gtest_discover_tests(test_tq_fast_structured_rotation)
+gtest_discover_tests(test_tq_circulant_gaussian_qjl)
 # SVS Tiered tests are slow in debug mode, so we set a longer timeout
 gtest_discover_tests(test_svs PROPERTIES TIMEOUT 3000)
