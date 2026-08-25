@@ -16,6 +16,7 @@
 #include "VecSim/index_factories/tq_factory.h"
 #include "VecSim/vec_sim.h"
 #include "tq_paper_reference.h"
+#include "unit_test_utils.h"
 
 #include <algorithm>
 #include <array>
@@ -742,6 +743,40 @@ TEST(TQHNSWDistanceTest, raw_unsafe_and_context_scores_match_normal_query_path) 
             VecSimIndex_AdhocBfCtx_Free(context);
         }
     }
+}
+
+TEST(TQHNSWDistanceTest, c_api_contains_query_preprocessing_allocation_failures) {
+    constexpr size_t dim = 8;
+    auto params = CreateTQHNSWParams(dim, VecSimMetric_IP, 43, true, 4, 8, 40, 40);
+    std::unique_ptr<VecSimIndex, decltype(&VecSimIndex_Free)> index(VecSimIndex_New(&params),
+                                                                    VecSimIndex_Free);
+    const std::array<float, dim> vector = {1.2f, -0.4f, 0.2f, 0.7f, 0.1f, 0.3f, -0.8f, 0.5f};
+    const std::array<float, dim> query = {2.4f, -0.8f, 1.1f, 0.3f, -1.7f, 0.9f, 0.5f, -0.6f};
+    ASSERT_EQ(VecSimIndex_AddVector(index.get(), vector.data(), 10), 1);
+    const uint64_t memory_before = index->getAllocationSize();
+
+    double raw_distance = 0.0;
+    size_t raw_failures = 0;
+    {
+        test_utils::ScopedFailingAllocator allocator(/*successful_allocations_before_failure=*/0);
+        raw_distance = VecSimIndex_GetDistanceFrom_Unsafe(index.get(), 10, query.data());
+        raw_failures = allocator.failureCount();
+    }
+    EXPECT_TRUE(std::isnan(raw_distance));
+    EXPECT_GT(raw_failures, 0U);
+    EXPECT_EQ(index->getAllocationSize(), memory_before);
+
+    VecSimAdhocBfCtx *context = nullptr;
+    size_t context_failures = 0;
+    {
+        // Let the context object allocate, then fail its TQ operation scratch allocation.
+        test_utils::ScopedFailingAllocator allocator(/*successful_allocations_before_failure=*/1);
+        context = VecSimIndex_AdhocBfCtx_New(index.get(), query.data());
+        context_failures = allocator.failureCount();
+    }
+    EXPECT_EQ(context, nullptr);
+    EXPECT_GT(context_failures, 0U);
+    EXPECT_EQ(index->getAllocationSize(), memory_before);
 }
 
 TEST(TQHNSWDistanceTest, multi_value_raw_query_uses_minimum_approximate_score) {

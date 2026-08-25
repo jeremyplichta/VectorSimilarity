@@ -272,6 +272,75 @@ TEST(TQHNSWTieredIndexTest, context_scores_full_buffer_and_write_in_place_insert
     VecSimTieredIndex_ReleaseSharedLocks(index);
 }
 
+TEST(TQHNSWTieredIndexTest, c_api_contains_backend_query_preprocessing_allocation_failures) {
+    constexpr size_t dim = 16;
+    TQHNSWParams tq_params = {
+        .type = VecSimType_FLOAT32,
+        .dim = dim,
+        .metric = VecSimMetric_IP,
+        .multi = false,
+        .initialCapacity = 0,
+        .blockSize = 4,
+        .bits = 4,
+        .projections = dim,
+        .seed = 31,
+        .useRotation = true,
+        .M = 16,
+        .efConstruction = 200,
+        .efRuntime = 50,
+        .epsilon = 0.01,
+    };
+    VecSimParams primary_params = {
+        .algo = VecSimAlgo_TQ_HNSW,
+        .algoParams = {.tqHnswParams = tq_params},
+    };
+    auto mock_thread_pool = tieredIndexMock();
+    TieredIndexParams tiered_params = {
+        .jobQueue = &mock_thread_pool.jobQ,
+        .jobQueueCtx = mock_thread_pool.ctx,
+        .submitCb = tieredIndexMock::submit_callback,
+        .flatBufferLimit = SIZE_MAX,
+        .primaryIndexParams = &primary_params,
+        .specificParams = {TieredHNSWParams{.swapJobThreshold = 0}},
+    };
+    auto *index =
+        reinterpret_cast<TieredHNSWIndex<float, float> *>(TieredFactory::NewIndex(&tiered_params));
+    ASSERT_NE(index, nullptr);
+    mock_thread_pool.ctx->index_strong_ref.reset(index);
+
+    const std::array<float, dim> vector = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::array<float, dim> query = {0.5f, 1.5f, -0.7f, 0.2f, 0.1f, 0, 0, 0,
+                                          0,    0,    0,     0,    0,    0, 0, 0};
+    ASSERT_EQ(VecSimIndex_AddVector(index, vector.data(), 1), 1);
+    const uint64_t memory_before = index->getAllocationSize();
+
+    auto run_with_backend_preprocessing_failure = [&](auto &&operation) {
+        size_t failures = 0;
+        {
+            // Allow the tiered context, frontend query, and backend context allocations. The next
+            // allocation is the backend TQ operation scratch.
+            test_utils::ScopedFailingAllocator allocator(
+                /*successful_allocations_before_failure=*/3);
+            operation();
+            failures = allocator.failureCount();
+        }
+        EXPECT_GT(failures, 0U);
+        EXPECT_EQ(index->getAllocationSize(), memory_before);
+    };
+
+    VecSimTieredIndex_AcquireSharedLocks(index);
+    VecSimAdhocBfCtx *context = nullptr;
+    run_with_backend_preprocessing_failure(
+        [&] { context = VecSimIndex_AdhocBfCtx_New(index, query.data()); });
+    EXPECT_EQ(context, nullptr);
+
+    double raw_distance = 0.0;
+    run_with_backend_preprocessing_failure(
+        [&] { raw_distance = VecSimIndex_GetDistanceFrom_Unsafe(index, 1, query.data()); });
+    VecSimTieredIndex_ReleaseSharedLocks(index);
+    EXPECT_TRUE(std::isnan(raw_distance));
+}
+
 TYPED_TEST(HNSWTieredIndexTest, CreateIndexInstance) {
     // Create TieredHNSW index instance with a mock queue.
     HNSWParams params = {.type = TypeParam::get_index_type(),

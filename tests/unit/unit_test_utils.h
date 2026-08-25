@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <cmath>
 #include <cstring>
@@ -118,6 +120,62 @@ inline VecSimParams CreateParams(const SVSParams &svs_params) {
 }
 
 namespace test_utils {
+
+/**
+ * Temporarily replaces VecSim's process-wide memory functions with an allocator that succeeds a
+ * fixed number of times and then returns NULL. Do not perform test assertions while the guard is
+ * active: their incidental allocations would make the failure point nondeterministic.
+ */
+class ScopedFailingAllocator {
+public:
+    explicit ScopedFailingAllocator(size_t successful_allocations_before_failure) {
+        remaining_successes.store(successful_allocations_before_failure, std::memory_order_relaxed);
+        failures.store(0, std::memory_order_relaxed);
+        VecSim_SetMemoryFunctions({.allocFunction = allocate,
+                                   .callocFunction = callocate,
+                                   .reallocFunction = reallocate,
+                                   .freeFunction = std::free});
+    }
+
+    ~ScopedFailingAllocator() {
+        VecSim_SetMemoryFunctions({.allocFunction = std::malloc,
+                                   .callocFunction = std::calloc,
+                                   .reallocFunction = std::realloc,
+                                   .freeFunction = std::free});
+    }
+
+    ScopedFailingAllocator(const ScopedFailingAllocator &) = delete;
+    ScopedFailingAllocator &operator=(const ScopedFailingAllocator &) = delete;
+
+    size_t failureCount() const { return failures.load(std::memory_order_relaxed); }
+
+private:
+    static bool shouldSucceed() {
+        size_t remaining = remaining_successes.load(std::memory_order_relaxed);
+        while (remaining != 0) {
+            if (remaining_successes.compare_exchange_weak(remaining, remaining - 1,
+                                                          std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        failures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    static void *allocate(size_t size) { return shouldSucceed() ? std::malloc(size) : nullptr; }
+
+    static void *callocate(size_t count, size_t size) {
+        return shouldSucceed() ? std::calloc(count, size) : nullptr;
+    }
+
+    static void *reallocate(void *ptr, size_t size) {
+        return shouldSucceed() ? std::realloc(ptr, size) : nullptr;
+    }
+
+    inline static std::atomic_size_t remaining_successes{0};
+    inline static std::atomic_size_t failures{0};
+};
+
 template <typename IndexParams>
 inline VecSimIndex *CreateNewIndex(IndexParams &index_params, VecSimType type,
                                    bool is_multi = false) {

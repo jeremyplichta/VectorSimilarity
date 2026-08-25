@@ -234,7 +234,11 @@ extern "C" int VecSimIndex_DeleteVector(VecSimIndex *index, size_t label) {
 
 extern "C" double VecSimIndex_GetDistanceFrom_Unsafe(VecSimIndex *index, size_t label,
                                                      const void *blob) {
-    return index->getDistanceFrom_Unsafe(label, blob);
+    try {
+        return index->getDistanceFrom_Unsafe(label, blob);
+    } catch (...) {
+        return INVALID_SCORE;
+    }
 }
 
 extern "C" size_t VecSimIndex_EstimateElementSize(const VecSimParams *params) {
@@ -444,7 +448,11 @@ extern "C" bool VecSimIndex_PreferAdHocSearch(VecSimIndex *index, size_t subsetS
 
 // Ad-hoc Brute Force Context API - delegates to virtual methods on the index/context
 extern "C" VecSimAdhocBfCtx *VecSimIndex_AdhocBfCtx_New(VecSimIndex *index, const void *queryBlob) {
-    return index->newAdhocBfCtx(queryBlob);
+    try {
+        return index->newAdhocBfCtx(queryBlob);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 extern "C" void VecSimIndex_AdhocBfCtx_Free(VecSimAdhocBfCtx *ctx) {

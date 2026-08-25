@@ -86,7 +86,7 @@ int VecSimIndex_DeleteVector(VecSimIndex *index, size_t label);
  * @param blob binary representation of the second vector. Blob size should match the index data
  * type and dimension, and pre-normalized if needed.
  * @return The distance (according to the index's distance metric) between `blob` and the vector
- * with label  label`.
+ * with label `label`, or NAN if the label is missing or scoring cannot be completed.
  */
 double VecSimIndex_GetDistanceFrom_Unsafe(VecSimIndex *index, size_t label, const void *blob);
 
@@ -244,7 +244,8 @@ typedef struct VecSimAdhocBfCtx VecSimAdhocBfCtx;
  * @brief Create an ad-hoc brute force context - preprocesses query once.
  * @param index the index to create the context for.
  * @param queryBlob binary representation of the query vector.
- * @return A new context, or NULL for index types that don't support this API.
+ * @return A new context, or NULL if the index does not support this API or query preprocessing
+ * cannot be completed.
  */
 VecSimAdhocBfCtx *VecSimIndex_AdhocBfCtx_New(VecSimIndex *index, const void *queryBlob);
 
