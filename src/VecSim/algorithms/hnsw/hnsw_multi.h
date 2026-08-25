@@ -52,6 +52,10 @@ private:
         return keys;
     };
 
+protected:
+    inline bool hasLabel(labelType label) const {
+        return labelLookup.find(label) != labelLookup.end();
+    }
     inline double getDistanceFromInternal(labelType label, const void *vector_data) const;
 
 public:

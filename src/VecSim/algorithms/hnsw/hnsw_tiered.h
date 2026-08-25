@@ -148,6 +148,52 @@ private:
 #endif
 
 public:
+    /**
+     * Ad-hoc scoring context for tiered TQ-HNSW.
+     *
+     * The frontend query is normalized/copied once and the backend context owns the expanded TQ
+     * query. Like getDistanceFrom_Unsafe(), callers must hold the tiered shared locks, including
+     * the HNSW index-data guard, for the whole scoring loop.
+     */
+    class TieredTQHNSWAdhocBfCtx final : public VecSimAdhocBfCtx {
+    public:
+        TieredTQHNSWAdhocBfCtx(const TieredHNSWIndex &index, const void *raw_query)
+            : VecSimAdhocBfCtx(index.getAllocator()), index(index),
+              frontend_query(index.frontendIndex->preprocessQuery(raw_query, true)),
+              backend_context(index.backendIndex->newAdhocBfCtx(raw_query)) {
+            assert(backend_context);
+        }
+
+        ~TieredTQHNSWAdhocBfCtx() override {
+            // Keep the backend allocator alive until its context allocation has been released.
+            auto backend_allocator = backend_context->getAllocator();
+            delete backend_context;
+        }
+
+        double getDistanceFrom(labelType label) const override {
+            const double frontend_distance =
+                index.frontendIndex->getDistanceFrom_Unsafe(label, frontend_query.get());
+            if (!index.backendIndex->isMultiValue() && !std::isnan(frontend_distance)) {
+                return frontend_distance;
+            }
+            return std::fmin(frontend_distance, backend_context->getDistanceFrom(label));
+        }
+
+        // TQ-HNSW does not retain raw backend vectors, so this is approximate TQ scoring rather
+        // than exact FP32 reranking.
+        void getExactDistances(const labelType *labels, double *distances_out,
+                               size_t count) const override {
+            for (size_t i = 0; i < count; ++i) {
+                distances_out[i] = getDistanceFrom(labels[i]);
+            }
+        }
+
+    private:
+        const TieredHNSWIndex &index;
+        MemoryUtils::unique_blob frontend_query;
+        VecSimAdhocBfCtx *backend_context;
+    };
+
     class TieredHNSW_BatchIterator : public VecSimBatchIterator {
     private:
         const TieredHNSWIndex<DataType, DistType> *index;
@@ -212,6 +258,12 @@ public:
     size_t indexSize() const override;
     size_t indexCapacity() const override;
     double getDistanceFrom_Unsafe(labelType label, const void *blob) const override;
+    VecSimAdhocBfCtx *newAdhocBfCtx(const void *queryBlob) const override {
+        if (this->backendIndex->basicInfo().algo != VecSimAlgo_TQ_HNSW) {
+            return nullptr;
+        }
+        return new (this->allocator) TieredTQHNSWAdhocBfCtx(*this, queryBlob);
+    }
     // Do nothing here, each tier (flat buffer and HNSW) should increase capacity for itself when
     // needed.
     VecSimIndexDebugInfo debugInfo() const override;
@@ -897,6 +949,14 @@ int TieredHNSWIndex<DataType, DistType>::deleteVector(labelType label) {
 template <typename DataType, typename DistType>
 double TieredHNSWIndex<DataType, DistType>::getDistanceFrom_Unsafe(labelType label,
                                                                    const void *blob) const {
+    if (this->backendIndex->basicInfo().algo == VecSimAlgo_TQ_HNSW) {
+        auto *context = newAdhocBfCtx(blob);
+        const double distance = context->getDistanceFrom(label);
+        auto context_allocator = context->getAllocator();
+        delete context;
+        return distance;
+    }
+
     // Try to get the distance from the flat buffer.
     // If the label doesn't exist, the distance will be NaN.
     auto flat_dist = this->frontendIndex->getDistanceFrom_Unsafe(label, blob);

@@ -15,7 +15,7 @@
  * @brief Base class for ad-hoc brute force context.
  *
  * Provides the interface for distance lookups during hybrid queries.
- * Derived classes implement index-specific logic (e.g., disk SQ8 vs RAM FP32).
+ * Derived classes implement index-specific logic (e.g., disk SQ8, RAM FP32, or TQ estimates).
  *
  * Inherits from VecsimBaseObject to support allocator-aware memory management,
  * allowing derived classes to use placement new with VecSimAllocator.
@@ -36,7 +36,8 @@ struct VecSimAdhocBfCtx : public VecsimBaseObject {
      * @brief Get distance from preprocessed query to a single label.
      *
      * For disk indexes: tries flat buffer first (exact FP32), then SQ8 backend (approximate).
-     * For RAM indexes: returns exact distance.
+     * For RAM indexes: returns the index's normal per-label distance. Quantized RAM indexes may
+     * return an approximate distance.
      *
      * @param label The label to compute distance to.
      * @return Distance, or NAN if label not found.
@@ -47,7 +48,8 @@ struct VecSimAdhocBfCtx : public VecsimBaseObject {
      * @brief Get exact distances for a batch of labels.
      *
      * For disk indexes: fetches FP32 vectors from disk, computes exact distances.
-     * For RAM indexes: same as calling getDistanceFrom() for each label.
+     * For RAM indexes: same as calling getDistanceFrom() for each label. Quantized indexes that do
+     * not retain raw vectors cannot provide exact FP32 reranking through this method.
      *
      * @param labels Input array of labels.
      * @param distances_out Output array, filled with exact distances (NAN if not found).

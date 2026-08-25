@@ -23,6 +23,7 @@
 #include <memory>
 #include <numeric>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -388,6 +389,87 @@ TEST(TQFlatTest, hnsw_uses_paper_asymmetric_search_and_explicit_decode_maintenan
     const auto results = TopK(index.get(), query.data(), 5);
     ASSERT_FALSE(results.empty());
     EXPECT_EQ(results[0].first, 1);
+}
+
+TEST(TQHNSWDistanceTest, raw_unsafe_and_context_scores_match_normal_query_path) {
+    constexpr size_t dim = 8;
+    const std::array<std::array<float, dim>, 3> vectors = {{
+        {1.2f, -0.4f, 0.2f, 0.7f, 0.1f, 0.3f, -0.8f, 0.5f},
+        {-0.3f, 0.9f, 0.5f, -0.2f, 0.7f, -0.1f, 0.4f, 0.8f},
+        {0.6f, 0.2f, -0.7f, 0.1f, 0.9f, 0.3f, -0.5f, -0.4f},
+    }};
+    const std::array<float, dim> query = {2.4f, -0.8f, 1.1f, 0.3f, -1.7f, 0.9f, 0.5f, -0.6f};
+
+    for (VecSimMetric metric : {VecSimMetric_Cosine, VecSimMetric_IP}) {
+        for (size_t bits : {size_t{2}, size_t{4}, size_t{8}}) {
+            SCOPED_TRACE(::testing::Message() << "metric=" << metric << " bits=" << bits);
+            auto params = CreateTQHNSWParams(dim, metric, 43, true, bits, 8, 40, 40);
+            std::unique_ptr<VecSimIndex, decltype(&VecSimIndex_Free)> index(
+                VecSimIndex_New(&params), VecSimIndex_Free);
+            for (size_t i = 0; i < vectors.size(); ++i) {
+                ASSERT_EQ(VecSimIndex_AddVector(index.get(), vectors[i].data(), 10 + i), 1);
+            }
+
+            const auto results = TopK(index.get(), query.data(), vectors.size());
+            ASSERT_EQ(results.size(), vectors.size());
+            for (const auto &[label, score] : results) {
+                EXPECT_NEAR(VecSimIndex_GetDistanceFrom_Unsafe(index.get(), label, query.data()),
+                            score, 1e-6);
+            }
+            EXPECT_TRUE(
+                std::isnan(VecSimIndex_GetDistanceFrom_Unsafe(index.get(), 999, query.data())));
+
+            TQFlatDetails::ResetQueryPreprocessingCount();
+            VecSimAdhocBfCtx *context = VecSimIndex_AdhocBfCtx_New(index.get(), query.data());
+            ASSERT_NE(context, nullptr);
+            for (size_t iteration = 0; iteration < 100; ++iteration) {
+                const auto &[label, score] = results[iteration % results.size()];
+                EXPECT_NEAR(VecSimIndex_AdhocBfCtx_GetDistanceFrom(context, label), score, 1e-6);
+            }
+            EXPECT_TRUE(std::isnan(VecSimIndex_AdhocBfCtx_GetDistanceFrom(context, 999)));
+            EXPECT_EQ(TQFlatDetails::GetQueryPreprocessingCount(), 1U);
+
+            std::array<size_t, 4> labels = {10, 11, 12, 999};
+            std::array<double, 4> distances{};
+            VecSimIndex_AdhocBfCtx_GetExactDistances(context, labels.data(), distances.data(),
+                                                     labels.size());
+            for (size_t i = 0; i < vectors.size(); ++i) {
+                EXPECT_NEAR(
+                    distances[i],
+                    VecSimIndex_GetDistanceFrom_Unsafe(index.get(), labels[i], query.data()), 1e-6);
+            }
+            EXPECT_TRUE(std::isnan(distances.back()));
+            VecSimIndex_AdhocBfCtx_Free(context);
+        }
+    }
+}
+
+TEST(TQHNSWDistanceTest, multi_value_raw_query_uses_minimum_approximate_score) {
+    constexpr size_t dim = 8;
+    auto params = CreateTQHNSWParams(dim, VecSimMetric_IP, 47, true, 4, 8, 40, 40);
+    params.algoParams.tqHnswParams.multi = true;
+    std::unique_ptr<VecSimIndex, decltype(&VecSimIndex_Free)> index(VecSimIndex_New(&params),
+                                                                    VecSimIndex_Free);
+    const std::array<float, dim> first = {1.0f, 0.2f, -0.4f, 0.1f, 0.7f, -0.2f, 0.5f, 0.3f};
+    const std::array<float, dim> second = {-0.3f, 1.4f, 0.2f, -0.7f, 0.1f, 0.8f, -0.5f, 0.4f};
+    const std::array<float, dim> other = {0.2f, -0.1f, 0.9f, 0.6f, -0.8f, 0.5f, 0.3f, -0.2f};
+    const std::array<float, dim> query = {2.0f, -0.7f, 1.3f, 0.4f, -0.9f, 0.8f, 0.2f, -0.5f};
+    ASSERT_EQ(VecSimIndex_AddVector(index.get(), first.data(), 7), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index.get(), second.data(), 7), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index.get(), other.data(), 8), 1);
+
+    const auto results = TopK(index.get(), query.data(), 2);
+    ASSERT_EQ(results.size(), 2U);
+    const auto result = std::find_if(results.begin(), results.end(),
+                                     [](const auto &entry) { return entry.first == 7; });
+    ASSERT_NE(result, results.end());
+    EXPECT_NEAR(VecSimIndex_GetDistanceFrom_Unsafe(index.get(), 7, query.data()), result->second,
+                1e-6);
+
+    VecSimAdhocBfCtx *context = VecSimIndex_AdhocBfCtx_New(index.get(), query.data());
+    ASSERT_NE(context, nullptr);
+    EXPECT_NEAR(VecSimIndex_AdhocBfCtx_GetDistanceFrom(context, 7), result->second, 1e-6);
+    VecSimIndex_AdhocBfCtx_Free(context);
 }
 
 TEST(TQFlatTest, rejects_non_paper_parameters) {

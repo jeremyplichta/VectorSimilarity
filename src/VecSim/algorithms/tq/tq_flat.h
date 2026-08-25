@@ -15,6 +15,7 @@
 #include "VecSim/utils/vec_utils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -24,6 +25,14 @@
 #include <vector>
 
 namespace TQFlatDetails {
+
+#ifdef BUILD_TESTS
+inline std::atomic_size_t query_preprocessing_count{0};
+
+inline void ResetQueryPreprocessingCount() { query_preprocessing_count.store(0); }
+
+inline size_t GetQueryPreprocessingCount() { return query_preprocessing_count.load(); }
+#endif
 
 inline float NormalizeInPlace(float *values, size_t dim) {
     const float norm_sq = SumSquaresScalar(values, dim);
@@ -163,6 +172,9 @@ public:
 
     void preprocessQuery(const void *original_blob, void *&query_blob, size_t &input_blob_size,
                          unsigned char alignment) const override {
+#ifdef BUILD_TESTS
+        query_preprocessing_count.fetch_add(1);
+#endif
         if (!query_blob) {
             query_blob = this->allocator->allocate_aligned(state->queryBlobSize(), alignment);
         }

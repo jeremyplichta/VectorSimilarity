@@ -124,6 +124,154 @@ TEST(TQHNSWTieredIndexTest, background_insert_moves_raw_vector_into_quantized_ba
     VecSimQueryReply_Free(results);
 }
 
+TEST(TQHNSWTieredIndexTest, raw_and_context_scoring_survive_migration_and_update) {
+    constexpr size_t dim = 16;
+    const std::array<float, dim> original = {1.2f, -0.4f, 0.2f,  0.7f, 0.1f, 0.3f, -0.8f, 0.5f,
+                                             0.6f, 0.2f,  -0.7f, 0.1f, 0.9f, 0.3f, -0.5f, -0.4f};
+    const std::array<float, dim> updated = {-0.3f, 0.9f,  0.5f, -0.2f, 0.7f,  -0.1f, 0.4f, 0.8f,
+                                            0.2f,  -0.6f, 0.1f, 1.1f,  -0.8f, 0.5f,  0.3f, -0.4f};
+    const std::array<float, dim> query = {2.4f, -0.8f, 1.1f,  0.3f, -1.7f, 0.9f,  0.5f, -0.6f,
+                                          0.4f, 1.2f,  -0.3f, 0.8f, 0.2f,  -0.9f, 0.7f, 0.1f};
+
+    for (VecSimMetric metric : {VecSimMetric_Cosine, VecSimMetric_IP}) {
+        SCOPED_TRACE(::testing::Message() << "metric=" << metric);
+        TQHNSWParams tq_params = {
+            .type = VecSimType_FLOAT32,
+            .dim = dim,
+            .metric = metric,
+            .multi = false,
+            .initialCapacity = 0,
+            .blockSize = 4,
+            .bits = 4,
+            .projections = dim,
+            .seed = 17,
+            .useRotation = true,
+            .M = 16,
+            .efConstruction = 200,
+            .efRuntime = 50,
+            .epsilon = 0.01,
+        };
+        VecSimParams primary_params = {
+            .algo = VecSimAlgo_TQ_HNSW,
+            .algoParams = {.tqHnswParams = tq_params},
+        };
+        auto mock_thread_pool = tieredIndexMock();
+        TieredIndexParams tiered_params = {
+            .jobQueue = &mock_thread_pool.jobQ,
+            .jobQueueCtx = mock_thread_pool.ctx,
+            .submitCb = tieredIndexMock::submit_callback,
+            .flatBufferLimit = SIZE_MAX,
+            .primaryIndexParams = &primary_params,
+            .specificParams = {TieredHNSWParams{.swapJobThreshold = 0}},
+        };
+        auto *index = reinterpret_cast<TieredHNSWIndex<float, float> *>(
+            TieredFactory::NewIndex(&tiered_params));
+        ASSERT_NE(index, nullptr);
+        mock_thread_pool.ctx->index_strong_ref.reset(index);
+
+        auto score_direct_and_context = [&](labelType label) {
+            VecSimTieredIndex_AcquireSharedLocks(index);
+            const double direct = VecSimIndex_GetDistanceFrom_Unsafe(index, label, query.data());
+            VecSimAdhocBfCtx *context = VecSimIndex_AdhocBfCtx_New(index, query.data());
+            EXPECT_NE(context, nullptr);
+            const double contextual = VecSimIndex_AdhocBfCtx_GetDistanceFrom(context, label);
+            VecSimIndex_AdhocBfCtx_Free(context);
+            VecSimTieredIndex_ReleaseSharedLocks(index);
+            EXPECT_TRUE(std::isfinite(direct));
+            EXPECT_NEAR(contextual, direct, 1e-6);
+            return direct;
+        };
+        auto topk_score = [&]() {
+            auto *reply = VecSimIndex_TopKQuery(index, query.data(), 1, nullptr, BY_SCORE);
+            EXPECT_EQ(VecSimQueryReply_Len(reply), 1U);
+            const double score = VecSimQueryResult_GetScore(&reply->results[0]);
+            VecSimQueryReply_Free(reply);
+            return score;
+        };
+
+        ASSERT_EQ(VecSimIndex_AddVector(index, original.data(), 1), 1);
+        EXPECT_EQ(index->getFlatBufferIndex()->indexSize(), 1U);
+        EXPECT_NEAR(score_direct_and_context(1), topk_score(), 1e-6);
+
+        mock_thread_pool.thread_iteration();
+        EXPECT_EQ(index->getFlatBufferIndex()->indexSize(), 0U);
+        EXPECT_EQ(index->indexSize() - index->getFlatBufferIndex()->indexSize(), 1U);
+        EXPECT_NEAR(score_direct_and_context(1), topk_score(), 1e-6);
+
+        ASSERT_EQ(VecSimIndex_AddVector(index, updated.data(), 1), 0);
+        EXPECT_EQ(index->getFlatBufferIndex()->indexSize(), 1U);
+        // The frontend owns the newest value and must win without consulting the stale backend.
+        std::array<float, dim> frontend_query = query;
+        if (metric == VecSimMetric_Cosine) {
+            VecSim_Normalize(frontend_query.data(), dim, VecSimType_FLOAT32);
+        }
+        const double expected_frontend =
+            index->getFlatBufferIndex()->getDistanceFrom_Unsafe(1, frontend_query.data());
+        EXPECT_NEAR(score_direct_and_context(1), expected_frontend, 1e-6);
+    }
+}
+
+TEST(TQHNSWTieredIndexTest, context_scores_full_buffer_and_write_in_place_insertions) {
+    constexpr size_t dim = 16;
+    TQHNSWParams tq_params = {
+        .type = VecSimType_FLOAT32,
+        .dim = dim,
+        .metric = VecSimMetric_IP,
+        .multi = false,
+        .initialCapacity = 0,
+        .blockSize = 4,
+        .bits = 4,
+        .projections = dim,
+        .seed = 29,
+        .useRotation = true,
+        .M = 16,
+        .efConstruction = 200,
+        .efRuntime = 50,
+        .epsilon = 0.01,
+    };
+    VecSimParams primary_params = {
+        .algo = VecSimAlgo_TQ_HNSW,
+        .algoParams = {.tqHnswParams = tq_params},
+    };
+    auto mock_thread_pool = tieredIndexMock();
+    TieredIndexParams tiered_params = {
+        .jobQueue = &mock_thread_pool.jobQ,
+        .jobQueueCtx = mock_thread_pool.ctx,
+        .submitCb = tieredIndexMock::submit_callback,
+        .flatBufferLimit = 1,
+        .primaryIndexParams = &primary_params,
+        .specificParams = {TieredHNSWParams{.swapJobThreshold = 0}},
+    };
+    auto *index =
+        reinterpret_cast<TieredHNSWIndex<float, float> *>(TieredFactory::NewIndex(&tiered_params));
+    ASSERT_NE(index, nullptr);
+    mock_thread_pool.ctx->index_strong_ref.reset(index);
+    const std::array<float, dim> first = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::array<float, dim> full_buffer = {0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::array<float, dim> in_place = {0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::array<float, dim> query = {0.5f, 1.5f, -0.7f, 0.2f, 0.1f, 0, 0, 0,
+                                          0,    0,    0,     0,    0,    0, 0, 0};
+    ASSERT_EQ(VecSimIndex_AddVector(index, first.data(), 1), 1);
+    ASSERT_EQ(VecSimIndex_AddVector(index, full_buffer.data(), 2), 1);
+    EXPECT_EQ(index->getFlatBufferIndex()->indexSize(), 1U);
+    EXPECT_EQ(index->indexSize() - index->getFlatBufferIndex()->indexSize(), 1U);
+
+    VecSim_SetWriteMode(VecSim_WriteInPlace);
+    ASSERT_EQ(VecSimIndex_AddVector(index, in_place.data(), 3), 1);
+    VecSim_SetWriteMode(VecSim_WriteAsync);
+    EXPECT_EQ(index->indexSize() - index->getFlatBufferIndex()->indexSize(), 2U);
+
+    VecSimTieredIndex_AcquireSharedLocks(index);
+    VecSimAdhocBfCtx *context = VecSimIndex_AdhocBfCtx_New(index, query.data());
+    ASSERT_NE(context, nullptr);
+    for (labelType label : {labelType{1}, labelType{2}, labelType{3}}) {
+        EXPECT_NEAR(VecSimIndex_AdhocBfCtx_GetDistanceFrom(context, label),
+                    VecSimIndex_GetDistanceFrom_Unsafe(index, label, query.data()), 1e-6);
+    }
+    VecSimIndex_AdhocBfCtx_Free(context);
+    VecSimTieredIndex_ReleaseSharedLocks(index);
+}
+
 TYPED_TEST(HNSWTieredIndexTest, CreateIndexInstance) {
     // Create TieredHNSW index instance with a mock queue.
     HNSWParams params = {.type = TypeParam::get_index_type(),
